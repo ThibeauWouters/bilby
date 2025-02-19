@@ -344,7 +344,7 @@ def lal_binary_black_hole(
 
 def lal_binary_neutron_star(
         frequency_array, mass_1, mass_2, luminosity_distance, a_1, tilt_1,
-        phi_12, a_2, tilt_2, phi_jl, theta_jn, phase, lambda_1, lambda_2,
+        phi_12, a_2, tilt_2, phi_jl, theta_jn, phase, lambda_1, lambda_2, resonance_f_1, resonance_f_2, resonance_dPhi_1, resonance_dPhi_2,
         **kwargs):
     """ A Binary Neutron Star waveform model using lalsimulation
 
@@ -423,7 +423,7 @@ def lal_binary_neutron_star(
         frequency_array=frequency_array, mass_1=mass_1, mass_2=mass_2,
         luminosity_distance=luminosity_distance, theta_jn=theta_jn, phase=phase,
         a_1=a_1, a_2=a_2, tilt_1=tilt_1, tilt_2=tilt_2, phi_12=phi_12,
-        phi_jl=phi_jl, lambda_1=lambda_1, lambda_2=lambda_2, **waveform_kwargs)
+        phi_jl=phi_jl, lambda_1=lambda_1, lambda_2=lambda_2, resonance_f_1=resonance_f_1, resonance_f_2=resonance_f_2, resonance_dPhi_1=resonance_dPhi_1, resonance_dPhi_2=resonance_dPhi_2, **waveform_kwargs)
 
 
 def lal_eccentric_binary_black_hole_no_spins(
@@ -493,7 +493,7 @@ def lal_eccentric_binary_black_hole_no_spins(
         eccentricity=eccentricity, **waveform_kwargs)
 
 
-def set_waveform_dictionary(waveform_kwargs, lambda_1=0, lambda_2=0):
+def set_waveform_dictionary(waveform_kwargs, lambda_1=0, lambda_2=0, resonance_f_1=0.0, resonance_f_2=0.0, resonance_dPhi_1=0.0, resonance_dPhi_2=0.0):
     """
     Add keyword arguments to the :code:`LALDict` object.
 
@@ -517,6 +517,10 @@ def set_waveform_dictionary(waveform_kwargs, lambda_1=0, lambda_2=0):
     waveform_dictionary = waveform_kwargs.pop('lal_waveform_dictionary', CreateDict())
     waveform_kwargs["TidalLambda1"] = lambda_1
     waveform_kwargs["TidalLambda2"] = lambda_2
+    waveform_kwargs["resonance_f_1"] = resonance_f_1
+    waveform_kwargs["resonance_f_2"] = resonance_f_2
+    waveform_kwargs["resonance_dPhi_1"] = resonance_dPhi_1
+    waveform_kwargs["resonance_dPhi_2"] = resonance_dPhi_2
     waveform_kwargs["NumRelData"] = waveform_kwargs.pop("numerical_relativity_data", None)
 
     for key in [
@@ -527,8 +531,10 @@ def set_waveform_dictionary(waveform_kwargs, lambda_1=0, lambda_2=0):
     for key in list(waveform_kwargs.keys()).copy():
         func = getattr(lalsim, f"SimInspiralWaveformParamsInsert{key}", None)
         if func is None:
+            print(f"Could not find SimInspiralWaveformParamsInsert function for key {key}")
             continue
         value = waveform_kwargs.pop(key)
+        print(f"{key}: {value}")
         if func is not None and value is not None:
             func(waveform_dictionary, value)
 
@@ -545,7 +551,7 @@ def set_waveform_dictionary(waveform_kwargs, lambda_1=0, lambda_2=0):
 def _base_lal_cbc_fd_waveform(
         frequency_array, mass_1, mass_2, luminosity_distance, theta_jn, phase,
         a_1=0.0, a_2=0.0, tilt_1=0.0, tilt_2=0.0, phi_12=0.0, phi_jl=0.0,
-        lambda_1=0.0, lambda_2=0.0, eccentricity=0.0, **waveform_kwargs):
+        lambda_1=0.0, lambda_2=0.0, resonance_f_1=0.0, resonance_f_2=0.0, resonance_dPhi_1=0.0, resonance_dPhi_2=0.0, eccentricity=0.0, **waveform_kwargs):
     """ Generate a cbc waveform model using lalsimulation
 
     Parameters
@@ -596,7 +602,9 @@ def _base_lal_cbc_fd_waveform(
     catch_waveform_errors = waveform_kwargs.pop('catch_waveform_errors')
     pn_amplitude_order = waveform_kwargs['pn_amplitude_order']
 
-    waveform_dictionary = set_waveform_dictionary(waveform_kwargs, lambda_1, lambda_2)
+    waveform_dictionary = set_waveform_dictionary(waveform_kwargs, lambda_1, lambda_2, resonance_f_1, resonance_f_2, resonance_dPhi_1, resonance_dPhi_2)
+    for key, value in waveform_kwargs.items():
+        print(key, value)
     approximant = lalsim_GetApproximantFromString(waveform_approximant)
 
     if pn_amplitude_order != 0:
