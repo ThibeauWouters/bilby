@@ -1,4 +1,5 @@
 import re
+import os
 
 import numpy as np
 import scipy.stats
@@ -8,6 +9,24 @@ from .base import Prior, PriorException
 from ..utils import logger, infer_args_from_method, get_dict_with_properties
 from ..utils import random
 
+### flowjax
+try:
+    import jax
+    import json
+    import equinox as eqx
+    from flowjax.flows import block_neural_autoregressive_flow
+    from flowjax.distributions import Normal, Transformed
+except Exception as e:
+    raise ImportError(
+        "Flowjax not installed. Please install flowjax to use NFDist."
+    ) from e
+    
+### glasflow
+from glasflow.flows import RealNVP
+from scipy.stats import norm
+import torch
+from sklearn.preprocessing import MinMaxScaler
+import joblib
 
 class BaseJointPriorDist(object):
     def __init__(self, names, bounds=None):
@@ -938,3 +957,212 @@ class MultivariateNormal(MultivariateGaussian):
 
 class JointPriorDistError(PriorException):
     """Class for Error handling of JointPriorDists for JointPriors"""
+
+class NFDistFlowjax(BaseJointPriorDist):
+    """Class with normalizing flow as distribution for multivariate prior"""
+    
+    def __init__(self, 
+                 names,
+                 flow_filename: str):
+        
+        super(NFDistFlowjax, self).__init__(names=names)
+        self.flow_filename = flow_filename
+        n_dim = len(names)
+        
+        # Check if the filename exists:
+        if not os.path.isfile(flow_filename):
+            raise FileNotFoundError(f"File {flow_filename} does not exist.")
+        
+        # Load the flow
+        nf_kwargs_path = flow_filename.replace(".eqx", "_kwargs.json")
+        with open(nf_kwargs_path, "r") as f:
+            nf_kwargs = json.load(f)
+        print(f"The NF kwargs are: {nf_kwargs}")
+            
+        like_flow = block_neural_autoregressive_flow(
+            key=jax.random.PRNGKey(0),
+            base_dist=Normal(np.zeros(len(names))),
+            nn_depth=nf_kwargs["nn_depth"],
+            nn_block_dim=nf_kwargs["nn_block_dim"],
+        )
+        
+        _nf: Transformed = eqx.tree_deserialise_leaves(flow_filename, like=like_flow)
+        self.nf = _nf
+        
+        # Define the n-dimensional standard normal distribution for easier rescaling later on
+        names = [f"x{i}" for i in range(1, n_dim + 1)]
+
+        mu = [[0.0] * n_dim]
+        sigmas = [[1.0] * n_dim]
+        corrcoef = [[[1.0 if i == j else 0.0 for j in range(n_dim)] for i in range(n_dim)]]
+
+        self.mvg = MultivariateGaussianDist(
+            names=names,
+            mus=mu,
+            corrcoefs=corrcoef,
+            sigmas=sigmas,
+        )
+        
+    def _ln_prob(self, samp, lnprob, outbounds):
+        log_probs = self.nf.log_prob(samp)
+        return log_probs
+    
+    def _sample(self, size, **kwargs):
+        seed = np.random.randint(0, 2**32 - 1)
+        rng_key = jax.random.key(seed)
+        samples = self.nf.sample(rng_key, (size, ))
+        return samples
+    
+    def _rescale(self, samp, **kwargs):
+        raise ValueError("This does not seem to work yet?")
+        
+        # Rescale them with MultivariateGaussianDist from unit hypercube to Gaussian (base dist)
+        mvg_samp = self.mvg.rescale(samp)
+        
+        # Forward pass through the normalizing flow to give data space samples
+        # NOTE: transform expects a single sample, so we need to vmap over it
+        flow_samp = jax.vmap(self.nf.bijection.inverse)(mvg_samp)
+
+        return flow_samp
+    
+
+class NFPriorFlowjax(JointPrior):
+    def __init__(self, dist, name=None, latex_label=None, unit=None):
+        if not isinstance(dist, NFDistFlowjax):
+            raise JointPriorDistError(
+                "dist object must be instance of NFDist"
+            )
+        super(NFPriorFlowjax, self).__init__(
+            dist=dist, name=name, latex_label=latex_label, unit=unit
+        )
+
+
+class NFDist(BaseJointPriorDist):
+    """Class with normalizing flow as distribution for multivariate prior -- second attempt with glasflow"""
+    
+    def __init__(self, 
+                 names,
+                 flow_filename: str):
+        
+        super(NFDist, self).__init__(names=names)
+        self.flow_filename = flow_filename
+        
+        # Check if the filename exists:
+        if not os.path.isfile(flow_filename):
+            raise FileNotFoundError(f"File {flow_filename} does not exist.")
+        
+        kwargs_filename = flow_filename.replace(".pt", "_kwargs.json")
+        with open(kwargs_filename, "r") as f:
+            kwargs = json.load(f)
+            
+        flow = RealNVP(
+            n_inputs=self.num_vars,
+            n_transforms=kwargs["n_transforms"],
+            n_neurons=kwargs["n_neurons"],
+            batch_norm_between_transforms=True,
+        )
+        
+        # Load the scaler:
+        scaler_name = flow_filename.replace(".pt", "_scaler.gz")
+        self.scaler: MinMaxScaler = joblib.load(scaler_name)
+
+        # Load model weights
+        flow.load_state_dict(torch.load(flow_filename))
+        self.nf = flow
+        self.nf.eval()
+        for param in self.nf.parameters():
+            param.requires_grad = False
+        
+        # Define the n-dimensional standard normal distribution for easier rescaling later on
+        names = [f"x{i}" for i in range(1, self.num_vars + 1)]
+
+        mu = [[0.0] * self.num_vars]
+        sigmas = [[1.0] * self.num_vars]
+        corrcoef = [[[1.0 if i == j else 0.0 for j in range(self.num_vars)] for i in range(self.num_vars)]]
+
+        self.mvg = MultivariateGaussianDist(
+            names=names,
+            mus=mu,
+            corrcoefs=corrcoef,
+            sigmas=sigmas,
+        )
+        
+    def clean_samples(self, samp):
+        """
+        Sometimes the NF seemingly returns something slightly unphysical. Need to clip it or change some
+        """
+        
+        # First, fix the masses: make sure m1 > m2:
+        m1_samp = samp[:, 0]
+        m2_samp = samp[:, 1]
+        
+        m1 = np.maximum(m1_samp, m2_samp)
+        m2 = np.minimum(m1_samp, m2_samp)
+        
+        # Make sure lambdas are OK, after which we rebuild samp per dimensional case
+        if self.num_vars == 3:
+            lambda_2_samp = samp[:, 2]
+            lambda_2 = np.clip(lambda_2_samp, 0.0, None)
+            samp = np.column_stack((m1, m2, lambda_2))
+        
+        else:
+            lambda_1_samp = samp[:, 2]
+            lambda_2_samp = samp[:, 3]
+            
+            lambda_1_samp = np.clip(lambda_1_samp, 0.0, None)
+            lambda_2_samp = np.clip(lambda_2_samp, 0.0, None)
+            
+            # Make sure lambda_2 > lambda_1 for the 4D case
+            lambda_1 = np.minimum(lambda_1_samp, lambda_2_samp)
+            lambda_2 = np.maximum(lambda_1_samp, lambda_2_samp)
+            
+            samp = np.column_stack((m1, m2, lambda_1, lambda_2))
+            
+        return samp
+        
+    def _ln_prob(self, samp, lnprob, outbounds):
+        log_probs = self.nf.log_prob(samp)
+        return log_probs
+    
+    def _sample(self, size, **kwargs):
+        flow_samp = self.nf.sample(size)
+        flow_samp = flow_samp.cpu().numpy()
+        
+        # Rescale the samples with sklearn's MinMaxScaler
+        flow_samp = self.scaler.inverse_transform(flow_samp)
+        
+        # Clean the samples
+        flow_samp = self.clean_samples(flow_samp)
+        
+        return flow_samp
+    
+    def _rescale(self, samp, **kwargs):
+        # Rescale them with MultivariateGaussianDist from unit hypercube to Gaussian (base dist)
+        mvg_samp = self.mvg.rescale(samp)
+        
+        # Then use the flow map to transform 
+        mvg_samp = torch.tensor(mvg_samp, dtype=torch.float32)
+
+        # Pass through the normalizing flow (note: inverse outputs something in data space!) -- this returns samples and log determinant Jacobian, but ignore the latter here
+        flow_samp, _ = self.nf.inverse(mvg_samp)
+
+        # Convert the result back to NumPy if needed
+        flow_samp = flow_samp.cpu().numpy()
+        
+        # Rescale the samples with sklearn's MinMaxScaler
+        flow_samp = self.scaler.inverse_transform(flow_samp)
+    
+        # Clean the samples
+        flow_samp = self.clean_samples(flow_samp)
+        
+        return flow_samp
+
+class NFPrior(JointPrior):
+    def __init__(self, dist, name=None, latex_label=None, unit=None):
+        if not isinstance(dist, NFDist):
+            raise JointPriorDistError(
+                "dist object must be instance of NFDist"
+            )
+        super(NFPrior, self).__init__(
+            dist=dist, name=name, latex_label=latex_label, unit=unit
+        )
