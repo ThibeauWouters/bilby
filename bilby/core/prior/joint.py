@@ -23,6 +23,7 @@ except Exception as e:
     
 ### glasflow
 from glasflow.flows import RealNVP
+from glasflow.flows.nsf import CouplingNSF
 from scipy.stats import norm
 import torch
 from sklearn.preprocessing import MinMaxScaler
@@ -1055,11 +1056,17 @@ class NFDist(BaseJointPriorDist):
         with open(kwargs_filename, "r") as f:
             kwargs = json.load(f)
             
-        flow = RealNVP(
-            n_inputs=self.num_vars,
-            n_transforms=kwargs["n_transforms"],
-            n_neurons=kwargs["n_neurons"],
-            batch_norm_between_transforms=True,
+        # flow = RealNVP(
+        #     n_inputs=self.num_vars,
+        #     n_transforms=kwargs["n_transforms"],
+        #     n_neurons=kwargs["n_neurons"],
+        #     batch_norm_between_transforms=True,
+        # )
+        
+        flow = CouplingNSF(n_inputs=self.num_vars,
+                           n_transforms=kwargs["n_transforms"],
+                           n_neurons=kwargs["n_neurons"],
+                           n_blocks_per_transform=kwargs["n_blocks_per_transform"]
         )
         
         # Load the scaler:
@@ -1087,6 +1094,8 @@ class NFDist(BaseJointPriorDist):
             sigmas=sigmas,
         )
         
+        logger.info(f"Loaded NFDist prior with n_dim = {self.num_vars} from flow_filename = {self.flow_filename}")
+        
     def clean_samples(self, samp):
         """
         Sometimes the NF seemingly returns something slightly unphysical. Need to clip it or change some
@@ -1095,6 +1104,10 @@ class NFDist(BaseJointPriorDist):
         # First, fix the masses: make sure m1 > m2:
         m1_samp = samp[:, 0]
         m2_samp = samp[:, 1]
+        
+        # Make sure the masses are not too crazy out of the usual training bounds
+        m1_samp = np.clip(m1_samp, 0.5, 10.0)
+        m2_samp = np.clip(m2_samp, 0.5, 10.0)
         
         m1 = np.maximum(m1_samp, m2_samp)
         m2 = np.minimum(m1_samp, m2_samp)
@@ -1121,7 +1134,18 @@ class NFDist(BaseJointPriorDist):
         return samp
         
     def _ln_prob(self, samp, lnprob, outbounds):
+        # Ensure the shape is correct
+        if len(samp.shape) == 1:
+            samp = samp.reshape(1, self.num_vars)
+            
+        # Use the scaler to transform to the preprocessed space for the NF
+        samp = self.scaler.transform(samp)
+            
+        # Get the log-probability of the sample, passing to Torch tensor first
+        samp = torch.tensor(samp, dtype=torch.float32)
         log_probs = self.nf.log_prob(samp)
+        log_probs = log_probs.cpu().numpy()
+        
         return log_probs
     
     def _sample(self, size, **kwargs):
@@ -1131,14 +1155,19 @@ class NFDist(BaseJointPriorDist):
         # Rescale the samples with sklearn's MinMaxScaler
         flow_samp = self.scaler.inverse_transform(flow_samp)
         
-        # Clean the samples
-        flow_samp = self.clean_samples(flow_samp)
+        # Clean the samples -- return as float64 to not break dynesty
+        flow_samp = self.clean_samples(flow_samp).astype(np.float64)
         
         return flow_samp
     
     def _rescale(self, samp, **kwargs):
         # Rescale them with MultivariateGaussianDist from unit hypercube to Gaussian (base dist)
         mvg_samp = self.mvg.rescale(samp)
+        
+        # Ensure the shape is correct
+        mvg_samp = np.array(mvg_samp)
+        if len(mvg_samp.shape) == 1:
+            mvg_samp = mvg_samp.reshape(1, self.num_vars)
         
         # Then use the flow map to transform 
         mvg_samp = torch.tensor(mvg_samp, dtype=torch.float32)
@@ -1152,8 +1181,8 @@ class NFDist(BaseJointPriorDist):
         # Rescale the samples with sklearn's MinMaxScaler
         flow_samp = self.scaler.inverse_transform(flow_samp)
     
-        # Clean the samples
-        flow_samp = self.clean_samples(flow_samp)
+        # Clean the samples -- return as float64 to not break dynesty
+        flow_samp = self.clean_samples(flow_samp).astype(np.float64)
         
         return flow_samp
 
