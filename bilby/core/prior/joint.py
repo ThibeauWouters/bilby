@@ -9,19 +9,21 @@ from .base import Prior, PriorException
 from ..utils import logger, infer_args_from_method, get_dict_with_properties
 from ..utils import random
 
-### flowjax
-try:
-    import jax
-    import json
-    import equinox as eqx
-    from flowjax.flows import block_neural_autoregressive_flow
-    from flowjax.distributions import Normal, Transformed
-except Exception as e:
-    raise ImportError(
-        "Flowjax not installed. Please install flowjax to use NFDist."
-    ) from e
+# TODO: remove me if flowjax is not used in the end due to MPI issues
+# ### flowjax
+# try:
+#     import jax
+#     import json
+#     import equinox as eqx
+#     from flowjax.flows import block_neural_autoregressive_flow
+#     from flowjax.distributions import Normal, Transformed
+# except Exception as e:
+#     raise ImportError(
+#         "Flowjax not installed. Please install flowjax to use NFDist."
+#     ) from e
     
 ### glasflow
+import json
 from glasflow.flows import RealNVP
 from glasflow.flows.nsf import CouplingNSF
 from scipy.stats import norm
@@ -1316,7 +1318,7 @@ class NFDist(BaseJointPriorDist):
             flow_samp = self.scaler.inverse_transform(flow_samp)
             
             # Clean the samples -- return as float64 to not break dynesty
-            flow_samp = self.clean_samples(flow_samp).astype(np.float32)
+            flow_samp = self.clean_samples(flow_samp) # .astype(np.float32)
             
         return flow_samp
     
@@ -1343,7 +1345,7 @@ class NFDist(BaseJointPriorDist):
             flow_samp = self.scaler.inverse_transform(flow_samp)
         
             # Clean the samples -- return as float64 to not break dynesty
-            flow_samp = self.clean_samples(flow_samp).astype(np.float32)
+            flow_samp = self.clean_samples(flow_samp) # .astype(np.float32)
         
         return flow_samp
 
@@ -1365,6 +1367,7 @@ class NFPrior(JointPrior):
         float:
             the logp value for the prior at given sample
         """
+        val = float(val)
         self.dist.requested_parameters[self.name] = val
 
         if self.dist.filled_request():
@@ -1391,14 +1394,236 @@ class NFPrior(JointPrior):
                         )
 
             lnp = np.atleast_1d(self.dist.ln_prob(np.asarray(values).T).squeeze())
+            lnp = float(lnp)
 
             # reset the requested parameters
             self.dist.reset_request()
             return lnp
         else:
             # if not all parameters have been requested yet, just return 0
-            if isinstance(val, (float, int, np.float32)):
-                return np.array([0.0])
+            if isinstance(val, (float, int)):
+                # return np.array([0.0]) # this is for nessai
+                return 0.0
+            else:
+
+                try:
+                    # check value has a length
+                    len(val)
+                except Exception as e:
+                    raise TypeError("Invalid type for ln_prob: {}".format(e))
+
+                ret = np.zeros_like(val)
+                return ret
+            
+            
+# ---
+
+
+class NFDistConditional(BaseJointPriorDist):
+    """
+    Class with normalizing flow as distribution for multivariate prior with glasflow
+    
+    Conditional is somewhat misleading, but we isolate masses from Lambdas here. 
+    """
+    
+    def __init__(self, 
+                 names,
+                 flow_filename: str):
+        
+        super(NFDist, self).__init__(names=names)
+        self.flow_filename = flow_filename
+        
+        # Check if the filename exists:
+        if not os.path.isfile(flow_filename):
+            raise FileNotFoundError(f"File {flow_filename} does not exist.")
+        
+        kwargs_filename = flow_filename.replace(".pt", "_kwargs.json")
+        with open(kwargs_filename, "r") as f:
+            kwargs = json.load(f)
+            
+        flow = CouplingNSF(n_inputs=self.num_vars,
+                           n_transforms=kwargs["n_transforms"],
+                           n_neurons=kwargs["n_neurons"],
+                           n_blocks_per_transform=kwargs["n_blocks_per_transform"]
+        )
+        
+        # Load the scaler: # FIXME: what if we do not want the scaler, in the end?
+        scaler_name = flow_filename.replace(".pt", "_scaler.gz")
+        self.scaler: MinMaxScaler = joblib.load(scaler_name)
+
+        # Load model weights
+        flow.load_state_dict(torch.load(flow_filename))
+        self.nf = flow
+        self.nf.eval()
+        self.nf.compile()
+        # Test sample
+        with torch.inference_mode():
+            self.nf.sample(100)
+        
+        # Define the n-dimensional standard normal distribution for easier rescaling later on
+        names = [f"x{i}" for i in range(1, self.num_vars + 1)]
+
+        mu = [[0.0] * self.num_vars]
+        sigmas = [[1.0] * self.num_vars]
+        corrcoef = [[[1.0 if i == j else 0.0 for j in range(self.num_vars)] for i in range(self.num_vars)]]
+
+        self.mvg = MultivariateGaussianDist(
+            names=names,
+            mus=mu,
+            corrcoefs=corrcoef,
+            sigmas=sigmas,
+        )
+        
+        logger.info(f"Loaded NFDist prior with n_dim = {self.num_vars} from flow_filename = {self.flow_filename}")
+        
+    def clean_samples(self, samp):
+        """
+        Sometimes the NF seemingly returns something slightly unphysical. Need to clip it or change some
+        """
+        
+        # First, fix the masses: make sure m1 > m2:
+        m1_samp = samp[:, 0]
+        m2_samp = samp[:, 1]
+        
+        # Make sure the masses are not too crazy out of the usual training bounds
+        m1_samp = np.clip(m1_samp, 0.5, 10.0)
+        m2_samp = np.clip(m2_samp, 0.5, 10.0)
+        
+        m1 = np.maximum(m1_samp, m2_samp)
+        m2 = np.minimum(m1_samp, m2_samp)
+        
+        # Make sure lambdas are OK, after which we rebuild samp per dimensional case
+        if self.num_vars == 3:
+            lambda_2_samp = samp[:, 2]
+            lambda_2 = np.clip(lambda_2_samp, 0.0, None)
+            samp = np.column_stack((m1, m2, lambda_2))
+        
+        else:
+            lambda_1_samp = samp[:, 2]
+            lambda_2_samp = samp[:, 3]
+            
+            lambda_1_samp = np.clip(lambda_1_samp, 0.0, None)
+            lambda_2_samp = np.clip(lambda_2_samp, 0.0, None)
+            
+            # Make sure lambda_2 > lambda_1 for the 4D case
+            lambda_1 = np.minimum(lambda_1_samp, lambda_2_samp)
+            lambda_2 = np.maximum(lambda_1_samp, lambda_2_samp)
+            
+            samp = np.column_stack((m1, m2, lambda_1, lambda_2))
+            
+        return samp
+        
+    def _ln_prob(self, samp, lnprob, outbounds):
+        with torch.inference_mode():
+            # Ensure the shape is correct
+            if len(samp.shape) == 1:
+                samp = samp.reshape(1, self.num_vars)
+                
+            # Use the scaler to transform to the preprocessed space for the NF
+            samp = self.scaler.transform(samp)
+                
+            # Get the log-probability of the sample, passing to Torch tensor first
+            samp = torch.tensor(samp, dtype=torch.float32)
+            log_probs = self.nf.log_prob(samp)
+            log_probs = np.atleast_2d(log_probs.cpu().numpy())
+        
+        return log_probs
+    
+    def _sample(self, size, **kwargs):
+        with torch.inference_mode():
+            flow_samp = self.nf.sample(size)
+            flow_samp = flow_samp.cpu().numpy()
+            
+            # Rescale the samples with sklearn's MinMaxScaler
+            flow_samp = self.scaler.inverse_transform(flow_samp)
+            
+            # Clean the samples -- return as float64 to not break dynesty
+            flow_samp = self.clean_samples(flow_samp) # .astype(np.float32)
+            
+        return flow_samp
+    
+    def _rescale(self, samp, **kwargs):
+        with torch.inference_mode():
+            # Rescale them with MultivariateGaussianDist from unit hypercube to Gaussian (base dist)
+            mvg_samp = self.mvg.rescale(samp)
+            
+            # Ensure the shape is correct
+            mvg_samp = np.array(mvg_samp)
+            if len(mvg_samp.shape) == 1:
+                mvg_samp = mvg_samp.reshape(1, self.num_vars)
+            
+            # Then use the flow map to transform 
+            mvg_samp = torch.tensor(mvg_samp, dtype=torch.float32)
+
+            # Pass through the normalizing flow (note: inverse outputs something in data space!) -- this returns samples and log determinant Jacobian, but ignore the latter here
+            flow_samp, _ = self.nf.inverse(mvg_samp)
+
+            # Convert the result back to NumPy if needed
+            flow_samp = flow_samp.cpu().numpy()
+            
+            # Rescale the samples with sklearn's MinMaxScaler
+            flow_samp = self.scaler.inverse_transform(flow_samp)
+        
+            # Clean the samples -- return as float64 to not break dynesty
+            flow_samp = self.clean_samples(flow_samp) # .astype(np.float32)
+        
+        return flow_samp
+
+class NFPriorConditional(JointPrior):
+    """This is taken from Ann-Kristin Malz's code, glitchflow, available at https://zenodo.org/records/15316399"""
+    
+    def ln_prob(self, val):
+        """
+        Return the natural logarithm of the prior probability. Note that this
+        will not be correctly normalised if there are bounds on the
+        distribution.
+
+        Parameters
+        ==========
+        val: array_like
+            value to evaluate the prior log-prob at
+        Returns
+        =======
+        float:
+            the logp value for the prior at given sample
+        """
+        val = float(val)
+        self.dist.requested_parameters[self.name] = val
+
+        if self.dist.filled_request():
+            # all required parameters have been set
+            values = list(self.dist.requested_parameters.values())
+
+            # check for the same number of values for each parameter
+            for i in range(len(self.dist) - 1):
+                if isinstance(values[i], (list, np.ndarray)) or isinstance(
+                    values[i + 1], (list, np.ndarray)
+                ):
+                    if isinstance(values[i], (list, np.ndarray)) and isinstance(
+                        values[i + 1], (list, np.ndarray)
+                    ):
+                        if len(values[i]) != len(values[i + 1]):
+                            raise ValueError(
+                                "Each parameter must have the same "
+                                "number of requested values."
+                            )
+                    else:
+                        raise ValueError(
+                            "Each parameter must have the same "
+                            "number of requested values."
+                        )
+
+            lnp = np.atleast_1d(self.dist.ln_prob(np.asarray(values).T).squeeze())
+            lnp = float(lnp)
+
+            # reset the requested parameters
+            self.dist.reset_request()
+            return lnp
+        else:
+            # if not all parameters have been requested yet, just return 0
+            if isinstance(val, (float, int)):
+                # return np.array([0.0]) # this is for nessai
+                return 0.0
             else:
 
                 try:

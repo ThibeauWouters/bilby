@@ -586,7 +586,6 @@ class Sampler(object):
 
         """
         from ..utils.random import rng
-
         logger.info("Generating initial points from the prior")
         unit_cube = []
         parameters = []
@@ -595,10 +594,15 @@ class Sampler(object):
             unit = rng.uniform(0, 1, self.ndim)
             theta = self.prior_transform(unit)
             if self.check_draw(theta, warning=False):
+                print(f"Draw accepted: len(unit_cube) = {len(unit_cube)} / npoints = {npoints}")
                 unit_cube.append(unit)
                 parameters.append(theta)
                 likelihood.append(self.log_likelihood(theta))
 
+        logger.info("Generating initial points from the prior DONE!")
+        logger.info("Parameters shown now")
+        logger.info(np.array(parameters))
+        
         return np.array(unit_cube), np.array(parameters), np.array(likelihood)
 
     def check_draw(self, theta, warning=True):
