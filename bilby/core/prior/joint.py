@@ -1854,3 +1854,37 @@ class ConditionalGWPriorLoader:
         all_samples = {**conditional_samples, **individual_samples}
         
         return all_samples
+
+
+class ConditionalPriorDict:
+    """
+    A PriorDict-compatible wrapper for ConditionalGWPriorLoader.
+    This allows the conditional prior system to work seamlessly with bilby's sampling.
+    This is just a wrapper around ConditionalGWPriorLoader to make it compatible with bilby's prior system.
+    """
+    
+    def __init__(self, loader):
+        self.loader = loader
+        self.keys = loader.all_param_names
+        
+    def rescale(self, keys, unit_cube):
+        """Rescale from unit hypercube to parameter space"""
+        return self.loader.rescale(unit_cube)
+        
+    def ln_prob(self, parameters_dict):
+        """Evaluate log probability for parameters"""
+        # Extract parameter values in the correct order
+        param_array = [parameters_dict[key] for key in self.keys]
+        return self.loader.ln_prob(param_array)
+        
+    def __len__(self):
+        """Return total number of parameters"""
+        return self.loader.n_total
+        
+    def __getitem__(self, key):
+        """Allow bilby to access individual priors if needed"""
+        return self
+        
+    def sample(self, size=1):
+        """Generate samples from the hybrid prior"""
+        return self.loader.sample(size)
