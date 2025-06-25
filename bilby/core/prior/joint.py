@@ -295,13 +295,7 @@ class BaseJointPriorDist(object):
             An vector sample drawn from the multivariate Gaussian
             distribution.
         """
-        print("value")
-        print(value)
         samp = np.array(value)
-        
-        print("samp")
-        print(samp)
-        
         if len(samp.shape) == 1:
             samp = samp.reshape(1, self.num_vars)
 
@@ -1145,7 +1139,7 @@ class NFDistConditional(BaseJointPriorDist):
     chirp_mass, mass_ratio, and luminosity_distance.
     """
     def __init__(self, names, flow_filename: str, bounds: list):
-        super(NFDistConditional, self).__init__(names=names)
+        super(NFDistConditional, self).__init__(names=names, bounds=bounds)
         self.flow_filename = flow_filename
 
         # Load conditional NF model
@@ -1298,9 +1292,6 @@ class NFDistConditional(BaseJointPriorDist):
     def _rescale(self, samp, **kwargs):
         samp = np.atleast_1d(samp)
         
-        print("samp")
-        print(samp)
-
         # If this is a single value, we must be in a parameter-wise rescale step
         if samp.shape == (1,):
             # Try to recover from JointPrior coordination
