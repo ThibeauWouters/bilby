@@ -510,7 +510,7 @@ class PriorDict(dict):
             self._cached_normalizations[keys] = 1
             return 1
         all_samples = {key: np.array([]) for key in keys}
-        while np.count_nonzero(keep) < min_accept:
+        while np.count_nonzero(keep) < min_accept: # TODO: need to watch out for this while loop, might get stuck
             samples = self.sample_subset(keys=keys, size=sampling_chunk)
             for key in samples:
                 all_samples[key] = np.hstack([all_samples[key], samples[key].flatten()])
@@ -553,7 +553,7 @@ class PriorDict(dict):
                 constrained_prob[keep] = prob[keep] * ratio
                 return constrained_prob
 
-    def ln_prob(self, sample, axis=None, normalized=True):
+    def ln_prob(self, sample, axis=None, normalized=False): # FIXME: changed from default True to False!
         """
 
         Parameters
