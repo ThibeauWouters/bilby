@@ -809,7 +809,7 @@ class ConditionalPriorDict(PriorDict):
         prob = np.prod(res, **kwargs)
         return self.check_prob(sample, prob)
 
-    def ln_prob(self, sample, axis=None, normalized=True):
+    def ln_prob(self, sample, axis=None, normalized=False): # FIXME: changed from default True to False!
         """
 
         Parameters
@@ -966,6 +966,245 @@ class DirichletPriorDict(ConditionalPriorDict):
                 del prior_dict[key]
         obj = cls(**prior_dict)
         return obj
+
+
+class NFConditionalPrior(Prior):
+    """
+    A conditional prior that uses a normalizing flow to model tidal deformability
+    parameters (lambda_1, lambda_2) conditional on neutron star masses.
+    
+    This class integrates with bilby's ConditionalPriorDict to provide
+    p(Lambda_i | m_1, m_2) using a trained normalizing flow model.
+    """
+    
+    def __init__(self, nf_model_path, target_param, name=None, latex_label=None, 
+                 unit=None, boundary=None, minimum=0.0, maximum=10000.0):
+        """
+        Parameters
+        ==========
+        nf_model_path: str
+            Path to the trained normalizing flow model (.pt file)
+        target_param: str
+            Which lambda parameter this prior represents ('lambda_1' or 'lambda_2')
+        name: str, optional
+            Name of the parameter
+        latex_label: str, optional
+            LaTeX label for plotting
+        unit: str, optional
+            Unit of the parameter
+        boundary: str, optional
+            Boundary condition
+        minimum: float
+            Minimum value for the parameter
+        maximum: float
+            Maximum value for the parameter
+        """
+        import os
+        import json
+        import torch
+        from glasflow.flows import RealNVP
+        
+        # Load the NF model
+        if not os.path.isfile(nf_model_path):
+            raise FileNotFoundError(f"NF model file {nf_model_path} does not exist.")
+            
+        kwargs_file = nf_model_path.replace(".pt", "_kwargs.json")
+        with open(kwargs_file, "r") as f:
+            kwargs = json.load(f)
+            
+        # Validate model configuration
+        if kwargs["names"] != ["lambda_1", "lambda_2"]:
+            raise ValueError(f"Expected NF model for ['lambda_1', 'lambda_2'], got {kwargs['names']}")
+        if kwargs["names_conditional"] != ["m_1", "m_2"]:
+            raise ValueError(f"Expected NF conditioning on ['m_1', 'm_2'], got {kwargs['names_conditional']}")
+            
+        # Load the flow model
+        self.nf = RealNVP(
+            n_inputs=2,
+            n_conditional_inputs=2,
+            n_transforms=kwargs["n_transforms"],
+            n_neurons=kwargs["n_neurons"],
+            n_blocks_per_transform=kwargs["n_blocks_per_transform"],
+            batch_norm_between_transforms=True
+        )
+        self.nf.load_state_dict(torch.load(nf_model_path, map_location="cpu"))
+        self.nf.eval()
+        
+        # Store configuration
+        self.nf_model_path = nf_model_path
+        self.target_param = target_param
+        self.target_index = 0 if target_param == 'lambda_1' else 1
+        
+        # Initialize the base prior (we override the key methods)
+        super().__init__(
+            name=name or target_param,
+            latex_label=latex_label or f"$\\{target_param.replace('_', '_{') + '}'}$",
+            unit=unit,
+            boundary=boundary,
+            minimum=minimum,
+            maximum=maximum
+        )
+        
+        # Set required variables for ConditionalPriorDict
+        self.required_variables = ['chirp_mass', 'mass_ratio', 'luminosity_distance']
+        
+    def _convert_to_source_masses(self, chirp_mass, mass_ratio, dL):
+        """Convert detector-frame parameters to source-frame masses"""
+        from bilby.gw.conversion import (
+            luminosity_distance_to_redshift,
+            chirp_mass_and_mass_ratio_to_component_masses
+        )
+        z = luminosity_distance_to_redshift(dL)
+        mc_source = chirp_mass / (1 + z)
+        return chirp_mass_and_mass_ratio_to_component_masses(mc_source, mass_ratio)
+        
+    def sample(self, size=None, **required_variables):
+        """Sample from the conditional NF distribution"""
+        import torch
+        import numpy as np
+        
+        # Check for required variables
+        if not all(var in required_variables for var in self.required_variables):
+            missing = [var for var in self.required_variables if var not in required_variables]
+            raise ValueError(f"Missing required variables: {missing}")
+        
+        # Extract required variables
+        chirp_mass = required_variables['chirp_mass']
+        mass_ratio = required_variables['mass_ratio']
+        dL = required_variables['luminosity_distance']
+        
+        # Convert to source masses
+        m1, m2 = self._convert_to_source_masses(chirp_mass, mass_ratio, dL)
+        
+        # Handle vectorized inputs
+        if np.isscalar(chirp_mass):
+            batch_size = 1 if size is None else size
+            m1 = np.full(batch_size, m1)
+            m2 = np.full(batch_size, m2)
+        else:
+            batch_size = len(chirp_mass)
+            
+        # Sample from NF
+        with torch.inference_mode():
+            cond = torch.tensor(np.column_stack([m1, m2]), dtype=torch.float32)
+            lambdas = self.nf.sample(batch_size, conditional=cond).cpu().numpy()
+            
+            # Extract target parameter and enforce positivity
+            target_values = np.maximum(0.0, lambdas[:, self.target_index])
+            
+            # Enforce bounds
+            target_values = np.clip(target_values, self.minimum, self.maximum)
+            
+        result = target_values[0] if batch_size == 1 else target_values
+        self.least_recently_sampled = result
+        return result
+        
+    def rescale(self, val, **required_variables):
+        """Rescale from unit hypercube using inverse NF transform"""
+        import torch
+        import numpy as np
+        from scipy.stats import norm
+        
+        # Check for required variables
+        if not all(var in required_variables for var in self.required_variables):
+            return super().rescale(val)  # Fallback to uniform rescaling
+        
+        # Extract required variables
+        chirp_mass = required_variables['chirp_mass']
+        mass_ratio = required_variables['mass_ratio']  
+        dL = required_variables['luminosity_distance']
+        
+        # Convert to source masses
+        m1, m2 = self._convert_to_source_masses(chirp_mass, mass_ratio, dL)
+        
+        # Handle vectorized inputs
+        val = np.atleast_1d(val)
+        if np.isscalar(chirp_mass):
+            m1 = np.full(len(val), m1)
+            m2 = np.full(len(val), m2)
+        
+        with torch.inference_mode():
+            # Convert uniform samples to standard normal
+            normal_samples = norm.ppf(np.clip(val, 1e-10, 1-1e-10))
+            
+            # Create 2D normal samples (we need both lambda components for NF inverse)
+            # For the target component, use the provided val
+            # For the other component, use a neutral value (0.0 standard normal)
+            if self.target_index == 0:
+                normal_2d = np.column_stack([normal_samples, np.zeros(len(val))])
+            else:
+                normal_2d = np.column_stack([np.zeros(len(val)), normal_samples])
+                
+            normal_tensor = torch.tensor(normal_2d, dtype=torch.float32)
+            cond = torch.tensor(np.column_stack([m1, m2]), dtype=torch.float32)
+            
+            # Use NF inverse transform
+            lambdas, _ = self.nf.inverse(normal_tensor, conditional=cond)
+            lambdas = lambdas.cpu().numpy()
+            
+            # Extract target parameter and enforce bounds
+            target_values = lambdas[:, self.target_index]
+            target_values = np.maximum(0.0, target_values)
+            target_values = np.clip(target_values, self.minimum, self.maximum)
+            
+        return target_values[0] if len(target_values) == 1 else target_values
+        
+    def ln_prob(self, val, **required_variables):
+        """Compute log probability using the NF"""
+        import torch
+        import numpy as np
+        
+        # Check bounds first
+        val = np.atleast_1d(val)
+        out_of_bounds = (val < self.minimum) | (val > self.maximum)
+        if np.any(out_of_bounds):
+            return np.full_like(val, -np.inf, dtype=float)
+            
+        # Check for required variables
+        if not all(var in required_variables for var in self.required_variables):
+            return np.zeros_like(val, dtype=float)  # Return neutral log prob
+        
+        # Extract required variables
+        chirp_mass = required_variables['chirp_mass']
+        mass_ratio = required_variables['mass_ratio']
+        dL = required_variables['luminosity_distance']
+        
+        # Convert to source masses
+        m1, m2 = self._convert_to_source_masses(chirp_mass, mass_ratio, dL)
+        
+        # Handle vectorized inputs
+        if np.isscalar(chirp_mass):
+            m1 = np.full(len(val), m1)
+            m2 = np.full(len(val), m2)
+            
+        with torch.inference_mode():
+            # For NF log_prob, we need both lambda values
+            # We approximate by using the target value and a reference value for the other
+            if self.target_index == 0:
+                # val is lambda_1, use a reference lambda_2 (median value)
+                lambda_pairs = np.column_stack([val, np.full(len(val), 1000.0)])
+            else:
+                # val is lambda_2, use a reference lambda_1
+                lambda_pairs = np.column_stack([np.full(len(val), 1000.0), val])
+                
+            x = torch.tensor(lambda_pairs, dtype=torch.float32)
+            cond = torch.tensor(np.column_stack([m1, m2]), dtype=torch.float32)
+            
+            # Get log prob from NF (this is the joint log prob)
+            joint_logp = self.nf.log_prob(x, conditional=cond).cpu().numpy()
+            
+        return joint_logp[0] if len(joint_logp) == 1 else joint_logp
+        
+    def prob(self, val, **required_variables):
+        """Return the prior probability"""
+        return np.exp(self.ln_prob(val, **required_variables))
+        
+    def get_instantiation_dict(self):
+        """Return dictionary for reconstructing this prior"""
+        instantiation_dict = super().get_instantiation_dict()
+        instantiation_dict['nf_model_path'] = self.nf_model_path
+        instantiation_dict['target_param'] = self.target_param
+        return instantiation_dict
 
 
 class ConditionalPriorDictException(PriorDictException):
