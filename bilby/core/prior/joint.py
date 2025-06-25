@@ -1140,466 +1140,219 @@ class NFPrior(JointPrior):
 
 class NFDistConditional(BaseJointPriorDist):
     """
-    Conditional normalizing flow distribution for gravitational wave inference.
-    
-    This class implements p(chirp_mass, mass_ratio, luminosity_distance, lambda_1, lambda_2) where:
-    - chirp_mass, mass_ratio, luminosity_distance are sampled from base priors (using bilby conventions)
-    - lambda_1, lambda_2 are sampled from conditional NF: p(lambda_1, lambda_2 | m_1_source, m_2_source)
-    
-    The workflow is:
-    1. Sample chirp_mass, mass_ratio, luminosity_distance from base priors
-    2. Convert luminosity_distance to redshift using bilby.gw.conversion.luminosity_distance_to_redshift
-    3. Convert detector frame chirp_mass to source frame: Mc_source = Mc_detector / (1 + z)
-    4. Convert chirp_mass_source, mass_ratio to component masses using bilby.gw.conversion.chirp_mass_and_mass_ratio_to_component_masses
-    5. Use conditional NF to sample lambda_1, lambda_2 given m_1_source, m_2_source
+    Conditional normalizing flow prior distribution for multivariate inference,
+    modeling p(lambda_1, lambda_2 | m1_source, m2_source) with base priors over
+    chirp_mass, mass_ratio, and luminosity_distance.
     """
-    
-    def __init__(self, 
-                 names: list[str],
-                 flow_filename: str,
-                 bounds: list):
-        """
-        Initialize the conditional normalizing flow distribution.
+    def __init__(self, names, flow_filename: str, bounds: list):
+        super(NFDistConditional, self).__init__(names=names)
+        self.flow_filename = flow_filename
 
-        Args:
-            names (list[str]): Names of the parameters in the distribution. # FIXME: redundant, remove this
-            1. chirp_mass
-            2. mass_ratio
-            3. luminosity_distance
-            4. lambda_1
-            5. lambda_2
-            flow_filename (str): _description_
-            Mc_bounds (tuple, optional): Bounds for uniform chirp mass prior. Defaults to (1.0, 3.0).
-            q_bounds (tuple, optional): Bounds for uniform mass range prior. Defaults to (0.125, 1.0).
-            dL_bounds (tuple, optional): Bounds for UniformComovingVolume distance prior. Defaults to (1.0, 500.0).
-            lambda_bounds (tuple, optional): Bounds for lambda_1 and lambda_2. Defaults to (0.0, 5000.0).
-        """
-        
+        # Load conditional NF model
+        self.nf = self._load_conditional_flow_model(flow_filename)
+        self.nf.eval()
+        self.nf.compile()
+
+        # Base priors
         from .analytical import Uniform
         from bilby.gw.prior import UniformComovingVolume
-        
-        names = ["chirp_mass", "mass_ratio", "luminosity_distance", "lambda_1", "lambda_2"]
-        # super(NFDistConditional, self).__init__(names=names, bounds=bounds)
-        super(NFDistConditional, self).__init__(names=names)
-        
-        # Load the conditional flow model
-        self.flow_filename = flow_filename
-        self.nf = self._load_conditional_flow_model(flow_filename, device='cpu')
-        
-        Mc_bounds = bounds[0]
-        q_bounds = bounds[1]
-        dL_bounds = bounds[2]
-        lambda_bounds = (0.0, 50_000) # FIXME: dummy for now
-        
-        # Initialize base priors using bilby's GW-specific priors
-        # FIXME: might be better with a PriorDict?
-        self.base_priors = {}
-        self.base_priors["chirp_mass"] = Uniform(minimum=Mc_bounds[0], maximum=Mc_bounds[1], name="chirp_mass", latex_label='$M_c$')
-        self.base_priors["mass_ratio"] = Uniform(minimum=q_bounds[0], maximum=q_bounds[1], name="mass_ratio", latex_label='$q$') 
-        self.base_priors["luminosity_distance"] = UniformComovingVolume(minimum=dL_bounds[0], maximum=dL_bounds[1], name='luminosity_distance', latex_label='$D_L$')
-        
-        # Define the 2-dimensional standard normal distribution for rescaling lambda parameters only
-        mvg_names = ["lambda_1", "lambda_2"]
+        self.base_priors = {
+            "chirp_mass": Uniform(minimum=bounds[0][0], maximum=bounds[0][1], name="chirp_mass"),
+            "mass_ratio": Uniform(minimum=bounds[1][0], maximum=bounds[1][1], name="mass_ratio"),
+            "luminosity_distance": UniformComovingVolume(minimum=bounds[2][0], maximum=bounds[2][1], name="luminosity_distance")
+        }
+
+        # MVG base for latent space of lambda_1, lambda_2
         mu = [[0.0, 0.0]]
         sigmas = [[1.0, 1.0]]
         corrcoef = [[[1.0, 0.0], [0.0, 1.0]]]
-
-        self.mvg_lambda = MultivariateGaussianDist(
-            names=mvg_names,
+        self.mvg = MultivariateGaussianDist(
+            names=["lambda_1", "lambda_2"],
             mus=mu,
-            corrcoefs=corrcoef,
             sigmas=sigmas,
+            corrcoefs=corrcoef
         )
         
-        # Set individual parameter bounds for bilby integration
-        self.parameter_bounds = {
-            "chirp_mass": Mc_bounds,
-            "mass_ratio": q_bounds, 
-            "luminosity_distance": dL_bounds,
-            "lambda_1": lambda_bounds,
-            "lambda_2": lambda_bounds
-        }
-        
-        # Store bounds as properties for __repr__ compatibility
-        self.Mc_bounds = Mc_bounds
-        self.q_bounds = q_bounds
-        self.dL_bounds = dL_bounds
-        self.lambda_bounds = lambda_bounds
-        self.flow_filename = flow_filename
-        
-        # Initialize basic attributes needed by JointPrior
-        self.sampled_parameters =[]
+        self.sampled_parameters = []
         self.current_sample = {}
         self.rescale_parameters = {}
-        self.rescaled_results = {}  # Store results of joint rescaling
-        self.requested_parameters = {}  # For ln_prob coordination
-        
-        logger.info(f"Loaded conditional NFDist prior with n_dim = {self.num_vars} from flow_filename = {self.flow_filename}")
-        
+        self.rescaled_results = {}
+        self.requested_parameters = {name: None for name in self.names}
+
+        logger.info(f"Loaded NFDistConditional prior with n_dim = {self.num_vars} from {flow_filename}")
+    
+    def filled_request(self):
+        """
+        Check if all parameters in self.names have been requested for ln_prob.
+        """
+        return all(name in self.requested_parameters and self.requested_parameters[name] is not None for name in self.names)
+
+    def reset_request(self):
+        """
+        Reset requested parameters dictionary.
+        """
+        self.requested_parameters = {name: None for name in self.names}
+
+    def filled_rescale(self):
+        """
+        Check if all parameters in self.names have been provided for rescaling.
+        """
+        return all(name in self.rescale_parameters for name in self.names)
+
+    def reset_rescale(self):
+        """
+        Reset rescale parameters dictionary.
+        """
+        self.rescale_parameters = {}
+
     def reset_sampled(self):
         """
-        Reset the sampled parameters to empty.
+        Reset sampled parameters and current sample.
         """
         self.sampled_parameters = []
         self.current_sample = {}
-        
-    def reset_rescale(self):
-        """
-        Reset the rescale parameters to empty.
-        """
-        self.rescale_parameters = {}
-        self.rescaled_results = {}
-        
-    def _load_conditional_flow_model(self, flow_filename: str, device: str='cpu'):
-        """
-        Load and configure the conditional normalizing flow model.
-        
-        Parameters
-        ==========
-        flow_filename : str
-            Path to the conditional flow model (.pt file)
-        device : str, optional
-            Device to load the model on ('cpu' or 'cuda'). Default is 'cpu'.
-            
-        Returns
-        =======
-        flow : RealNVP
-            Loaded and configured conditional normalizing flow model
-        """
-        # Check if the filename exists
+
+    def _load_conditional_flow_model(self, flow_filename: str):
+
         if not os.path.isfile(flow_filename):
             raise FileNotFoundError(f"File {flow_filename} does not exist.")
-        
-        # Load model configuration
-        kwargs_filename = flow_filename.replace(".pt", "_kwargs.json")
-        with open(kwargs_filename, "r") as f:
+
+        kwargs_file = flow_filename.replace(".pt", "_kwargs.json")
+        with open(kwargs_file, "r") as f:
             kwargs = json.load(f)
-        
-        # Verify this is a conditional model (2 inputs for masses, 2 outputs for Lambdas)
-        if kwargs.get("names") != ["lambda_1", "lambda_2"]:
-            raise ValueError(f"Expected conditional model with ['lambda_1', 'lambda_2'], got {kwargs.get('names')}")
-        if kwargs.get("names_conditional") != ["m_1", "m_2"]:
-            raise ValueError(f"Expected conditional inputs ['m_1', 'm_2'], got {kwargs.get('names_conditional')}")
-            
-        # Create conditional NF for lambda_1, lambda_2 (2D output, 2D conditioning)
-        flow = RealNVP(n_inputs=2,  # lambda_1, lambda_2
-                       n_conditional_inputs=2,  # m_1_source, m_2_source
-                       n_transforms=kwargs["n_transforms"],
-                       n_neurons=kwargs["n_neurons"],
-                       n_blocks_per_transform=kwargs["n_blocks_per_transform"],
-                       batch_norm_between_transforms=True,
+
+        assert kwargs["names"] == ["lambda_1", "lambda_2"]
+        assert kwargs["names_conditional"] == ["m_1", "m_2"]
+
+        flow = RealNVP(
+            n_inputs=2,
+            n_conditional_inputs=2,
+            n_transforms=kwargs["n_transforms"],
+            n_neurons=kwargs["n_neurons"],
+            n_blocks_per_transform=kwargs["n_blocks_per_transform"],
+            batch_norm_between_transforms=True
         )
 
-        # Load model weights on specified device
-        flow.load_state_dict(torch.load(flow_filename, map_location=torch.device(device)))
-        flow.to(device)
-        flow.eval()
-        flow.compile()
-        
+        flow.load_state_dict(torch.load(flow_filename, map_location="cpu"))
         return flow
-        
-    def _convert_to_source_masses(self, chirp_mass_det, mass_ratio, luminosity_distance):
-        """
-        Convert detector frame parameters to source frame component masses.
-        Now fully vectorized to handle arrays efficiently.
-        
-        Parameters
-        ==========
-        chirp_mass_det: float or array
-            Detector frame chirp mass
-        mass_ratio: float or array
-            Mass ratio q = m2/m1
-        luminosity_distance: float or array
-            Luminosity distance in Mpc
-            
-        Returns
-        =======
-        m1_source: float or array
-            Source frame mass of primary
-        m2_source: float or array  
-            Source frame mass of secondary
-        """
-        from bilby.gw.conversion import (luminosity_distance_to_redshift, 
-                                         chirp_mass_and_mass_ratio_to_component_masses)
-        
-        # Convert luminosity distance to redshift (handles arrays)
-        redshift = luminosity_distance_to_redshift(luminosity_distance)
-        
-        # Convert detector frame chirp mass to source frame (vectorized)
-        chirp_mass_source = chirp_mass_det / (1.0 + redshift)
-        
-        # Convert source frame chirp mass and mass ratio to component masses (handles arrays)
-        m1_source, m2_source = chirp_mass_and_mass_ratio_to_component_masses(
-            chirp_mass_source, mass_ratio)
-            
-        return m1_source, m2_source
-        
+
+    def _convert_to_source_masses(self, chirp_mass, mass_ratio, dL):
+        from bilby.gw.conversion import (
+            luminosity_distance_to_redshift,
+            chirp_mass_and_mass_ratio_to_component_masses
+        )
+        z = luminosity_distance_to_redshift(dL)
+        mc_source = chirp_mass / (1 + z)
+        return chirp_mass_and_mass_ratio_to_component_masses(mc_source, mass_ratio)
+
+    def _sample(self, size, **kwargs):
+        samples = []
+        with torch.inference_mode():
+            for _ in range(size):
+                # Base parameter sampling
+                mc = self.base_priors["chirp_mass"].sample()
+                q = self.base_priors["mass_ratio"].sample()
+                dL = self.base_priors["luminosity_distance"].sample()
+
+                m1, m2 = self._convert_to_source_masses(mc, q, dL)
+                cond = torch.tensor([[m1, m2]], dtype=torch.float32)
+                lambdas = self.nf.sample(1, conditional=cond).cpu().numpy()[0]
+                lambda_1, lambda_2 = np.maximum(0.0, lambdas[0]), np.maximum(0.0, lambdas[1])
+
+                samples.append([mc, q, dL, lambda_1, lambda_2])
+
+        return np.array(samples)
+
     def _ln_prob(self, samp, lnprob, outbounds):
-        """
-        Calculate log probability for conditional prior.
-        Fully vectorized implementation for improved performance.
-        
-        Expected sample format: [chirp_mass, mass_ratio, luminosity_distance, lambda_1, lambda_2]
-        """
-        # Ensure the shape is correct
         if len(samp.shape) == 1:
-            samp = samp.reshape(1, self.num_vars)
-            
-        n_samples = samp.shape[0]
-        
-        # Set out-of-bounds samples to -inf
-        lnprob[outbounds] = -np.inf
-        
-        # Only process in-bounds samples
+            samp = samp[None, :]
+
         inbounds_mask = ~outbounds
         if not np.any(inbounds_mask):
+            lnprob[outbounds] = -np.inf
             return lnprob
-            
-        inbounds_samp = samp[inbounds_mask]
-        
-        # Extract base parameters and lambdas (vectorized)
-        chirp_mass = inbounds_samp[:, 0]
-        mass_ratio = inbounds_samp[:, 1] 
-        luminosity_distance = inbounds_samp[:, 2]
-        lambda_1 = inbounds_samp[:, 3]
-        lambda_2 = inbounds_samp[:, 4]
-        
-        # Calculate base prior log probabilities (vectorized)
-        base_ln_prob = np.zeros(len(inbounds_samp))
-        for i, (mc, q, dl) in enumerate(zip(chirp_mass, mass_ratio, luminosity_distance)):
-            base_ln_prob[i] = (self.base_priors["chirp_mass"].ln_prob(mc) +
-                              self.base_priors["mass_ratio"].ln_prob(q) +
-                              self.base_priors["luminosity_distance"].ln_prob(dl))
-        
-        # Convert to source frame masses for conditioning (vectorized)
-        m1_source, m2_source = self._convert_to_source_masses(chirp_mass, mass_ratio, luminosity_distance)
-            
-        # Calculate conditional NF log probability (batched)
-        with torch.inference_mode():
-            lambda_tensor = torch.tensor(np.column_stack([lambda_1, lambda_2]), dtype=torch.float32)
-            condition_tensor = torch.tensor(np.column_stack([m1_source, m2_source]), dtype=torch.float32)
-            nf_ln_prob = self.nf.log_prob(lambda_tensor, conditional=condition_tensor).cpu().numpy()
-        
-        # Total log probability is sum of base priors and conditional NF (vectorized)
-        total_ln_prob = base_ln_prob + nf_ln_prob
-        
-        # Store results back to the full lnprob array
-        lnprob[inbounds_mask] = total_ln_prob
-        
-        return lnprob
-    
-    def _sample(self, size, **kwargs):
-        """
-        Hierarchical sampling: base priors -> mass conversion -> conditional NF
-        
-        Returns samples in format: [chirp_mass, mass_ratio, luminosity_distance, lambda_1, lambda_2]
-        """
-        samples = np.zeros((size, self.num_vars))
-        
-        for i in range(size):
-            # Step 1: Sample base parameters
-            chirp_mass = self.base_priors["chirp_mass"].sample()
-            mass_ratio = self.base_priors["mass_ratio"].sample()
-            luminosity_distance = self.base_priors["luminosity_distance"].sample()
-            
-            # Step 2: Convert to source frame masses
-            m1_source, m2_source = self._convert_to_source_masses(chirp_mass, mass_ratio, luminosity_distance)
-                
-            # Step 3: Sample lambdas from conditional NF
-            with torch.inference_mode():
-                condition_tensor = torch.tensor([[m1_source, m2_source]], dtype=torch.float32)
-                lambda_samples = self.nf.sample(1, conditional=condition_tensor).cpu().numpy()[0]
-                lambda_1, lambda_2 = lambda_samples[0], lambda_samples[1]
-                
-                # Ensure physical values
-                lambda_1 = max(0.0, lambda_1)
-                lambda_2 = max(0.0, lambda_2)
-                
-            # Store sample
-            samples[i] = [chirp_mass, mass_ratio, luminosity_distance, lambda_1, lambda_2]
-        
-        # Update current_sample and sampled_parameters for JointPrior compatibility
-        if size == 1:
-            sample_dict = {
-                "chirp_mass": samples[0, 0],
-                "mass_ratio": samples[0, 1], 
-                "luminosity_distance": samples[0, 2],
-                "lambda_1": samples[0, 3],
-                "lambda_2": samples[0, 4]
-            }
-            self.current_sample = sample_dict
-            self.sampled_parameters = list(self.names)
-            samples
-            
-        return samples
-    
-    def _rescale(self, samp, **kwargs):
-        """
-        Rescale from unit hypercube to conditional prior.
-        
-        This method handles both:
-        1. Full 5D unit hypercube input (direct rescaling)
-        2. Individual parameter rescaling coordination (via rescale_parameters)
-        
-        Input: unit hypercube samples [0,1]^5 OR individual parameter value
-        Output: [chirp_mass, mass_ratio, luminosity_distance, lambda_1, lambda_2] OR single parameter value
-        """
-        samp = np.array(samp)
-        print("samp NFDISTOCNDIT")
-        print(samp)
-        
-        # Handle full 5D rescaling (when all parameters provided at once)
-        if hasattr(samp, 'shape') and len(samp.shape) >= 1 and samp.shape[-1] == self.num_vars:
-            if len(samp.shape) == 1:
-                samp = samp.reshape(1, self.num_vars)
-                
-            n_samples = samp.shape[0]
-            samples = np.zeros_like(samp)
-            
-            # Step 1: Vectorized rescaling of base parameters from unit hypercube
-            chirp_mass = np.array([self.base_priors["chirp_mass"].rescale(u) for u in samp[:, 0]])
-            mass_ratio = np.array([self.base_priors["mass_ratio"].rescale(u) for u in samp[:, 1]])
-            luminosity_distance = np.array([self.base_priors["luminosity_distance"].rescale(u) for u in samp[:, 2]])
-            
-            # Step 2: Vectorized conversion to source frame masses for conditioning
-            m1_source, m2_source = self._convert_to_source_masses(chirp_mass, mass_ratio, luminosity_distance)
-                
-            # Step 3: Vectorized rescaling of lambda parameters using conditional NF
-            with torch.inference_mode():
-                # First rescale all lambda unit samples to Gaussian space in batch
-                lambda_gaussian_samples = np.array([self.mvg_lambda.rescale(samp[i, 3:5]) for i in range(n_samples)])
-                lambda_gaussian_tensor = torch.tensor(lambda_gaussian_samples, dtype=torch.float32)
-                
-                # Then use conditional NF inverse transform in batch
-                condition_tensor = torch.tensor(np.column_stack([m1_source, m2_source]), dtype=torch.float32)
-                lambda_samples, _ = self.nf.inverse(lambda_gaussian_tensor, conditional=condition_tensor)
-                lambda_samples = lambda_samples.cpu().numpy()
-                
-                # Ensure physical values (vectorized clipping)
-                lambda_1 = np.maximum(0.0, lambda_samples[:, 0])
-                lambda_2 = np.maximum(0.0, lambda_samples[:, 1])
-            
-            # Store rescaled samples (vectorized assignment)
-            samples[:, 0] = chirp_mass
-            samples[:, 1] = mass_ratio
-            samples[:, 2] = luminosity_distance
-            samples[:, 3] = lambda_1
-            samples[:, 4] = lambda_2
-                
-            return np.squeeze(samples)
-        
-        # Handle coordination case: called from JointPrior.rescale() when all parameters are ready
-        # samp should be a 2D array with shape (1, 5) containing unit cube values for all parameters
-        else:
-            # This is the coordination case from JointPrior.rescale()
-            # samp is values = np.array(list(self.dist.rescale_parameters.values())).T
-            if hasattr(samp, 'shape') and samp.shape == (1, self.num_vars):
-                # Standard 5D rescaling
-                print(f"Might be in a loop?")
-                return self._rescale(samp, **kwargs)
-            elif hasattr(samp, '__len__') and len(samp) == self.num_vars:
-                # Convert to proper shape and rescale
-                samp_array = np.array(samp).reshape(1, self.num_vars)
-                result = self._rescale(samp_array, **kwargs)
-                # Return as flat array since JointPrior expects individual parameter values
-                return result.flatten() if hasattr(result, 'flatten') else result
-            else:
-                # Fallback: return input as-is
-                return samp
-    
-    # def reset_sampled(self):
-    #     """Reset the sampled parameters list and current sample for JointPrior compatibility."""
-    #     self.sampled_parameters = []
-    #     self.current_sample = {}
-    
-    # def reset_rescale(self):
-    #     """Reset the rescale parameters for JointPrior compatibility."""
-    #     self.rescale_parameters = {}
-    #     self.rescaled_results = {}
-    
-    # def filled_rescale(self):
-    #     """
-    #     Check if all conditional parameters have been provided for rescaling.
-    #     """
-    #     return all(name in self.rescale_parameters for name in self.names)
-    
-    # def filled_request(self):
-    #     """
-    #     Check if all conditional parameters have been provided for ln_prob evaluation.
-    #     """
-    #     return all(name in self.requested_parameters and self.requested_parameters[name] is not None for name in self.names)
-    
-    # def reset_request(self):
-    #     """
-    #     Reset the requested parameters for ln_prob evaluation.
-    #     """
-    #     self.requested_parameters = {name: None for name in self.names}
 
+        in_samp = samp[inbounds_mask]
+        mc, q, dL = in_samp[:, 0], in_samp[:, 1], in_samp[:, 2]
+        lambda_1, lambda_2 = in_samp[:, 3], in_samp[:, 4]
+
+        # Base prior log-prob
+        base_lnps = np.array([
+            self.base_priors["chirp_mass"].ln_prob(m) +
+            self.base_priors["mass_ratio"].ln_prob(r) +
+            self.base_priors["luminosity_distance"].ln_prob(l)
+            for m, r, l in zip(mc, q, dL)
+        ])
+
+        m1s, m2s = self._convert_to_source_masses(mc, q, dL)
+
+        with torch.inference_mode():
+            x = torch.tensor(np.column_stack([lambda_1, lambda_2]), dtype=torch.float32)
+            cond = torch.tensor(np.column_stack([m1s, m2s]), dtype=torch.float32)
+            logp = self.nf.log_prob(x, conditional=cond).cpu().numpy()
+
+        lnprob[inbounds_mask] = base_lnps + logp
+        lnprob[outbounds] = -np.inf
+        return lnprob
+
+    def _rescale(self, samp, **kwargs):
+        samp = np.atleast_1d(samp)
+        
+        print("samp")
+        print(samp)
+
+        # If this is a single value, we must be in a parameter-wise rescale step
+        if samp.shape == (1,):
+            # Try to recover from JointPrior coordination
+            if hasattr(self, "rescale_parameters") and self.filled_rescale():
+                # If we have all parameters, rescale together
+                next_param = [p for p in self.names if p not in self.rescale_parameters][0]
+                self.rescale_parameters[next_param] = samp[0]
+                
+                if len(self.rescale_parameters) == self.num_vars:
+                    # All 5 values collected, rescale together
+                    full_samp = np.array(list(self.rescale_parameters.values())).reshape(1, self.num_vars)
+                    self.rescale_parameters.clear()
+                    return self._rescale(full_samp, **kwargs).flatten()[self.names.index(next_param)]
+                else:
+                    # Wait for the rest
+                    return samp[0]
+            else:
+                # Not enough info, just store and wait
+                if hasattr(self, "rescale_parameters"):
+                    for name in self.names:
+                        if name not in self.rescale_parameters:
+                            self.rescale_parameters[name] = samp[0]
+                            break
+                else:
+                    self.rescale_parameters = {self.names[0]: samp[0]}
+                return samp[0]
+
+    def rescale(self, samp, **kwargs):
+        return self._rescale(samp, **kwargs)
 
 class ConditionalNFPrior(JointPrior):
-    """
-    JointPrior for the conditional version
-    """
-    
     def ln_prob(self, val):
-        """
-        Return the natural logarithm of the prior probability. Note that this
-        will not be correctly normalised if there are bounds on the
-        distribution.
-
-        Parameters
-        ==========
-        val: array_like
-            value to evaluate the prior log-prob at
-        Returns
-        =======
-        float:
-            the logp value for the prior at given sample
-        """
-        # val = float(val) # TODO: remove if OK?
         self.dist.requested_parameters[self.name] = val
-
         if self.dist.filled_request():
-            # all required parameters have been set
             values = list(self.dist.requested_parameters.values())
 
-            # check for the same number of values for each parameter
             for i in range(len(self.dist) - 1):
-                if isinstance(values[i], (list, np.ndarray)) or isinstance(
-                    values[i + 1], (list, np.ndarray)
-                ):
-                    if isinstance(values[i], (list, np.ndarray)) and isinstance(
-                        values[i + 1], (list, np.ndarray)
-                    ):
+                if isinstance(values[i], (list, np.ndarray)) or isinstance(values[i + 1], (list, np.ndarray)):
+                    if isinstance(values[i], (list, np.ndarray)) and isinstance(values[i + 1], (list, np.ndarray)):
                         if len(values[i]) != len(values[i + 1]):
-                            raise ValueError(
-                                "Each parameter must have the same "
-                                "number of requested values."
-                            )
+                            raise ValueError("Parameter arrays must have the same length.")
                     else:
-                        raise ValueError(
-                            "Each parameter must have the same "
-                            "number of requested values."
-                        )
+                        raise ValueError("Parameter arrays must have the same length.")
 
             lnp = np.atleast_1d(self.dist.ln_prob(np.asarray(values).T).squeeze())
-            lnp = float(lnp)
-
-            # reset the requested parameters
             self.dist.reset_request()
-            return lnp
+            return float(lnp)
         else:
-            # if not all parameters have been requested yet, just return 0
             if isinstance(val, (float, int)):
-                # return np.array([0.0]) # this is for nessai
                 return 0.0
-            else:
-
-                try:
-                    # check value has a length
-                    len(val)
-                except Exception as e:
-                    raise TypeError("Invalid type for ln_prob: {}".format(e))
-
-                ret = np.zeros_like(val)
-                return ret
+            try:
+                len(val)
+                return np.zeros_like(val)
+            except Exception as e:
+                raise TypeError(f"Invalid type for ln_prob: {e}")
