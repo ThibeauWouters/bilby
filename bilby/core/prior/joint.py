@@ -1327,6 +1327,38 @@ class NFDistConditional(BaseJointPriorDist):
                 else:
                     self.rescale_parameters = {self.names[0]: samp[0]}
                 return samp[0]
+        
+        # Handle full sample rescaling
+        if len(samp.shape) == 1:
+            samp = samp[None, :]
+        
+        # Rescale base parameters from unit hypercube
+        mc = self.base_priors["chirp_mass"].rescale(samp[:, 0])
+        q = self.base_priors["mass_ratio"].rescale(samp[:, 1])
+        dL = self.base_priors["luminosity_distance"].rescale(samp[:, 2])
+        
+        # Convert to source masses
+        m1s, m2s = self._convert_to_source_masses(mc, q, dL)
+        
+        # Use NF to generate lambdas conditioned on masses
+        with torch.inference_mode():
+            cond = torch.tensor(np.column_stack([m1s, m2s]), dtype=torch.float32)
+            # Use the last 2 dimensions of unit hypercube for lambda generation
+            uniform_samples = samp[:, 3:5]  # lambda_1, lambda_2 from unit hypercube
+            # First map to standard normal using inverse CDF, then use NF inverse
+            normal_samples = self.mvg.rescale(uniform_samples)
+            # Ensure normal_samples is 2D
+            if len(normal_samples.shape) == 1:
+                normal_samples = normal_samples[None, :]
+            normal_tensor = torch.tensor(normal_samples, dtype=torch.float32)
+            lambdas, _ = self.nf.inverse(normal_tensor, conditional=cond)
+            lambdas = lambdas.cpu().numpy()
+            lambda_1 = np.maximum(0.0, lambdas[:, 0])
+            lambda_2 = np.maximum(0.0, lambdas[:, 1])
+        
+        # Return rescaled parameters
+        result = np.column_stack([mc, q, dL, lambda_1, lambda_2])
+        return result.squeeze() if result.shape[0] == 1 else result
 
     def rescale(self, samp, **kwargs):
         return self._rescale(samp, **kwargs)
