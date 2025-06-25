@@ -506,6 +506,13 @@ class Sampler(object):
         =======
         list: Properly rescaled sampled values
         """
+        logger.info("Transforming prior samples to target space")
+        logger.info("DEBUG: theta")
+        logger.info(theta)
+        
+        logger.info("DEBUG: self._search_parameter_keys")
+        logger.info(self._search_parameter_keys)
+        
         return self.priors.rescale(self._search_parameter_keys, theta)
 
     def log_prior(self, theta):
@@ -591,8 +598,17 @@ class Sampler(object):
         parameters = []
         likelihood = []
         while len(unit_cube) < npoints:
+            print(f"{len(unit_cube)}/{npoints}")
             unit = rng.uniform(0, 1, self.ndim)
+            
+            print("unit")
+            print(unit)
+            print("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
             theta = self.prior_transform(unit)
+            
+            print("theta")
+            print(theta)
+            
             if self.check_draw(theta, warning=False):
                 print(f"Draw accepted: len(unit_cube) = {len(unit_cube)} / npoints = {npoints}")
                 unit_cube.append(unit)
@@ -624,8 +640,14 @@ class Sampler(object):
             True if the likelihood and prior are finite, false otherwise
 
         """
+        print("Computing log_prior")
         log_p = self.log_prior(theta)
+        print(f"log_prior: {log_p}")
+        print("Computing log_likelihood")
         log_l = self.log_likelihood(theta)
+        print(f"log_likelihood: {log_l}")
+        
+        print("Checking bad values")
         return self._check_bad_value(
             val=log_p, warning=warning, theta=theta, label="prior"
         ) and self._check_bad_value(

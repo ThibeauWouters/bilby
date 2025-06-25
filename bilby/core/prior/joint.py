@@ -67,36 +67,6 @@ class BaseJointPriorDist(object):
         self._uncorrelated = None
         self._current_lnprob = None
 
-        # a dictionary of the parameters as requested by the prior
-        self.requested_parameters = dict()
-        self.reset_request()
-
-        # a dictionary of the rescaled parameters
-        self.rescale_parameters = dict()
-        self.reset_rescale()
-
-        # a list of sampled parameters
-        self.reset_sampled()
-
-    def reset_sampled(self):
-        self.sampled_parameters = []
-        self.current_sample = {}
-
-    def filled_request(self):
-        """
-        Check if all requested parameters have been filled.
-        """
-
-        return not np.any([val is None for val in self.requested_parameters.values()])
-
-    def reset_request(self):
-        """
-        Reset the requested parameters to None.
-        """
-
-        for name in self.names:
-            self.requested_parameters[name] = None
-
     def filled_rescale(self):
         """
         Check if all the rescaled parameters have been filled.
@@ -325,7 +295,13 @@ class BaseJointPriorDist(object):
             An vector sample drawn from the multivariate Gaussian
             distribution.
         """
+        print("value")
+        print(value)
         samp = np.array(value)
+        
+        print("samp")
+        print(samp)
+        
         if len(samp.shape) == 1:
             samp = samp.reshape(1, self.num_vars)
 
@@ -1113,7 +1089,7 @@ class NFPrior(JointPrior):
         float:
             the logp value for the prior at given sample
         """
-        val = float(val)
+        # val = float(val) # TODO: remove if OK?
         self.dist.requested_parameters[self.name] = val
 
         if self.dist.filled_request():
@@ -1181,9 +1157,7 @@ class NFDistConditional(BaseJointPriorDist):
     def __init__(self, 
                  names: list[str],
                  flow_filename: str,
-                 Mc_bounds: tuple = (1.0, 3.0),
-                 q_bounds: tuple = (0.125, 1.0),
-                 dL_bounds: tuple = (1.0, 500.0)):
+                 bounds: list):
         """
         Initialize the conditional normalizing flow distribution.
 
@@ -1198,19 +1172,27 @@ class NFDistConditional(BaseJointPriorDist):
             Mc_bounds (tuple, optional): Bounds for uniform chirp mass prior. Defaults to (1.0, 3.0).
             q_bounds (tuple, optional): Bounds for uniform mass range prior. Defaults to (0.125, 1.0).
             dL_bounds (tuple, optional): Bounds for UniformComovingVolume distance prior. Defaults to (1.0, 500.0).
+            lambda_bounds (tuple, optional): Bounds for lambda_1 and lambda_2. Defaults to (0.0, 5000.0).
         """
         
         from .analytical import Uniform
         from bilby.gw.prior import UniformComovingVolume
         
         names = ["chirp_mass", "mass_ratio", "luminosity_distance", "lambda_1", "lambda_2"]
+        # super(NFDistConditional, self).__init__(names=names, bounds=bounds)
         super(NFDistConditional, self).__init__(names=names)
-        self.flow_filename = flow_filename
         
         # Load the conditional flow model
+        self.flow_filename = flow_filename
         self.nf = self._load_conditional_flow_model(flow_filename, device='cpu')
         
+        Mc_bounds = bounds[0]
+        q_bounds = bounds[1]
+        dL_bounds = bounds[2]
+        lambda_bounds = (0.0, 50_000) # FIXME: dummy for now
+        
         # Initialize base priors using bilby's GW-specific priors
+        # FIXME: might be better with a PriorDict?
         self.base_priors = {}
         self.base_priors["chirp_mass"] = Uniform(minimum=Mc_bounds[0], maximum=Mc_bounds[1], name="chirp_mass", latex_label='$M_c$')
         self.base_priors["mass_ratio"] = Uniform(minimum=q_bounds[0], maximum=q_bounds[1], name="mass_ratio", latex_label='$q$') 
@@ -1229,10 +1211,44 @@ class NFDistConditional(BaseJointPriorDist):
             sigmas=sigmas,
         )
         
-        # Initialize storage for rescaled results coordination
-        self.rescaled_results = {}
+        # Set individual parameter bounds for bilby integration
+        self.parameter_bounds = {
+            "chirp_mass": Mc_bounds,
+            "mass_ratio": q_bounds, 
+            "luminosity_distance": dL_bounds,
+            "lambda_1": lambda_bounds,
+            "lambda_2": lambda_bounds
+        }
+        
+        # Store bounds as properties for __repr__ compatibility
+        self.Mc_bounds = Mc_bounds
+        self.q_bounds = q_bounds
+        self.dL_bounds = dL_bounds
+        self.lambda_bounds = lambda_bounds
+        self.flow_filename = flow_filename
+        
+        # Initialize basic attributes needed by JointPrior
+        self.sampled_parameters =[]
+        self.current_sample = {}
+        self.rescale_parameters = {}
+        self.rescaled_results = {}  # Store results of joint rescaling
+        self.requested_parameters = {}  # For ln_prob coordination
         
         logger.info(f"Loaded conditional NFDist prior with n_dim = {self.num_vars} from flow_filename = {self.flow_filename}")
+        
+    def reset_sampled(self):
+        """
+        Reset the sampled parameters to empty.
+        """
+        self.sampled_parameters = []
+        self.current_sample = {}
+        
+    def reset_rescale(self):
+        """
+        Reset the rescale parameters to empty.
+        """
+        self.rescale_parameters = {}
+        self.rescaled_results = {}
         
     def _load_conditional_flow_model(self, flow_filename: str, device: str='cpu'):
         """
@@ -1401,93 +1417,129 @@ class NFDistConditional(BaseJointPriorDist):
                 
             # Store sample
             samples[i] = [chirp_mass, mass_ratio, luminosity_distance, lambda_1, lambda_2]
+        
+        # Update current_sample and sampled_parameters for JointPrior compatibility
+        if size == 1:
+            sample_dict = {
+                "chirp_mass": samples[0, 0],
+                "mass_ratio": samples[0, 1], 
+                "luminosity_distance": samples[0, 2],
+                "lambda_1": samples[0, 3],
+                "lambda_2": samples[0, 4]
+            }
+            self.current_sample = sample_dict
+            self.sampled_parameters = list(self.names)
+            samples
             
         return samples
     
     def _rescale(self, samp, **kwargs):
         """
         Rescale from unit hypercube to conditional prior.
-        Fully vectorized implementation for improved performance.
         
-        Input: unit hypercube samples [0,1]^5
-        Output: [chirp_mass, mass_ratio, luminosity_distance, lambda_1, lambda_2]
+        This method handles both:
+        1. Full 5D unit hypercube input (direct rescaling)
+        2. Individual parameter rescaling coordination (via rescale_parameters)
+        
+        Input: unit hypercube samples [0,1]^5 OR individual parameter value
+        Output: [chirp_mass, mass_ratio, luminosity_distance, lambda_1, lambda_2] OR single parameter value
         """
-        # Ensure the shape is correct
         samp = np.array(samp)
-        if len(samp.shape) == 1:
-            samp = samp.reshape(1, self.num_vars)
-            
-        n_samples = samp.shape[0]
-        samples = np.zeros_like(samp)
+        print("samp NFDISTOCNDIT")
+        print(samp)
         
-        # Step 1: Vectorized rescaling of base parameters from unit hypercube
-        chirp_mass = np.array([self.base_priors["chirp_mass"].rescale(u) for u in samp[:, 0]])
-        mass_ratio = np.array([self.base_priors["mass_ratio"].rescale(u) for u in samp[:, 1]])
-        luminosity_distance = np.array([self.base_priors["luminosity_distance"].rescale(u) for u in samp[:, 2]])
+        # Handle full 5D rescaling (when all parameters provided at once)
+        if hasattr(samp, 'shape') and len(samp.shape) >= 1 and samp.shape[-1] == self.num_vars:
+            if len(samp.shape) == 1:
+                samp = samp.reshape(1, self.num_vars)
+                
+            n_samples = samp.shape[0]
+            samples = np.zeros_like(samp)
+            
+            # Step 1: Vectorized rescaling of base parameters from unit hypercube
+            chirp_mass = np.array([self.base_priors["chirp_mass"].rescale(u) for u in samp[:, 0]])
+            mass_ratio = np.array([self.base_priors["mass_ratio"].rescale(u) for u in samp[:, 1]])
+            luminosity_distance = np.array([self.base_priors["luminosity_distance"].rescale(u) for u in samp[:, 2]])
+            
+            # Step 2: Vectorized conversion to source frame masses for conditioning
+            m1_source, m2_source = self._convert_to_source_masses(chirp_mass, mass_ratio, luminosity_distance)
+                
+            # Step 3: Vectorized rescaling of lambda parameters using conditional NF
+            with torch.inference_mode():
+                # First rescale all lambda unit samples to Gaussian space in batch
+                lambda_gaussian_samples = np.array([self.mvg_lambda.rescale(samp[i, 3:5]) for i in range(n_samples)])
+                lambda_gaussian_tensor = torch.tensor(lambda_gaussian_samples, dtype=torch.float32)
+                
+                # Then use conditional NF inverse transform in batch
+                condition_tensor = torch.tensor(np.column_stack([m1_source, m2_source]), dtype=torch.float32)
+                lambda_samples, _ = self.nf.inverse(lambda_gaussian_tensor, conditional=condition_tensor)
+                lambda_samples = lambda_samples.cpu().numpy()
+                
+                # Ensure physical values (vectorized clipping)
+                lambda_1 = np.maximum(0.0, lambda_samples[:, 0])
+                lambda_2 = np.maximum(0.0, lambda_samples[:, 1])
+            
+            # Store rescaled samples (vectorized assignment)
+            samples[:, 0] = chirp_mass
+            samples[:, 1] = mass_ratio
+            samples[:, 2] = luminosity_distance
+            samples[:, 3] = lambda_1
+            samples[:, 4] = lambda_2
+                
+            return np.squeeze(samples)
         
-        # Step 2: Vectorized conversion to source frame masses for conditioning
-        m1_source, m2_source = self._convert_to_source_masses(chirp_mass, mass_ratio, luminosity_distance)
-            
-        # Step 3: Vectorized rescaling of lambda parameters using conditional NF
-        with torch.inference_mode():
-            # First rescale all lambda unit samples to Gaussian space in batch
-            lambda_gaussian_samples = np.array([self.mvg_lambda.rescale(samp[i, 3:5]) for i in range(n_samples)])
-            lambda_gaussian_tensor = torch.tensor(lambda_gaussian_samples, dtype=torch.float32)
-            
-            # Then use conditional NF inverse transform in batch
-            condition_tensor = torch.tensor(np.column_stack([m1_source, m2_source]), dtype=torch.float32)
-            lambda_samples, _ = self.nf.inverse(lambda_gaussian_tensor, conditional=condition_tensor)
-            lambda_samples = lambda_samples.cpu().numpy()
-            
-            # Ensure physical values (vectorized clipping)
-            lambda_1 = np.maximum(0.0, lambda_samples[:, 0])
-            lambda_2 = np.maximum(0.0, lambda_samples[:, 1])
-        
-        # Store rescaled samples (vectorized assignment)
-        samples[:, 0] = chirp_mass
-        samples[:, 1] = mass_ratio
-        samples[:, 2] = luminosity_distance
-        samples[:, 3] = lambda_1
-        samples[:, 4] = lambda_2
-            
-        return np.squeeze(samples)
-
-
-class NFPriorConditional(JointPrior):
-    """This is inspired by Ann-Kristin Malz's code, glitchflow, available at https://zenodo.org/records/15316399"""
-    
-    def rescale(self, val, **kwargs):
-        """
-        Scale a unit hypercube sample to the prior.
-        For conditional priors, we need to handle the case where individual parameters
-        are being rescaled, which requires coordination through the joint distribution.
-        """
-        # Store this parameter's value for joint rescaling
-        self.dist.rescale_parameters[self.name] = val
-        
-        # If all parameters have been set, do the joint rescaling
-        if self.dist.filled_rescale():
-            # Get all parameter values in correct order
-            param_values = []
-            for param_name in self.dist.names:
-                param_values.append(self.dist.rescale_parameters[param_name])
-            
-            # Do joint rescaling
-            joint_rescaled = self.dist.rescale(np.array(param_values))
-            
-            # Store results for each parameter
-            for i, param_name in enumerate(self.dist.names):
-                self.dist.rescaled_results[param_name] = joint_rescaled[i]
-            
-            # Reset rescale parameters for next time
-            self.dist.reset_rescale()
-            
-            # Return this parameter's result
-            return self.dist.rescaled_results[self.name]
+        # Handle coordination case: called from JointPrior.rescale() when all parameters are ready
+        # samp should be a 2D array with shape (1, 5) containing unit cube values for all parameters
         else:
-            # Not all parameters set yet, return None or some placeholder
-            # This will be handled by bilby's sampling logic
-            return None
+            # This is the coordination case from JointPrior.rescale()
+            # samp is values = np.array(list(self.dist.rescale_parameters.values())).T
+            if hasattr(samp, 'shape') and samp.shape == (1, self.num_vars):
+                # Standard 5D rescaling
+                print(f"Might be in a loop?")
+                return self._rescale(samp, **kwargs)
+            elif hasattr(samp, '__len__') and len(samp) == self.num_vars:
+                # Convert to proper shape and rescale
+                samp_array = np.array(samp).reshape(1, self.num_vars)
+                result = self._rescale(samp_array, **kwargs)
+                # Return as flat array since JointPrior expects individual parameter values
+                return result.flatten() if hasattr(result, 'flatten') else result
+            else:
+                # Fallback: return input as-is
+                return samp
+    
+    # def reset_sampled(self):
+    #     """Reset the sampled parameters list and current sample for JointPrior compatibility."""
+    #     self.sampled_parameters = []
+    #     self.current_sample = {}
+    
+    # def reset_rescale(self):
+    #     """Reset the rescale parameters for JointPrior compatibility."""
+    #     self.rescale_parameters = {}
+    #     self.rescaled_results = {}
+    
+    # def filled_rescale(self):
+    #     """
+    #     Check if all conditional parameters have been provided for rescaling.
+    #     """
+    #     return all(name in self.rescale_parameters for name in self.names)
+    
+    # def filled_request(self):
+    #     """
+    #     Check if all conditional parameters have been provided for ln_prob evaluation.
+    #     """
+    #     return all(name in self.requested_parameters and self.requested_parameters[name] is not None for name in self.names)
+    
+    # def reset_request(self):
+    #     """
+    #     Reset the requested parameters for ln_prob evaluation.
+    #     """
+    #     self.requested_parameters = {name: None for name in self.names}
+
+
+class ConditionalNFPrior(JointPrior):
+    """
+    JointPrior for the conditional version
+    """
     
     def ln_prob(self, val):
         """
@@ -1504,13 +1556,13 @@ class NFPriorConditional(JointPrior):
         float:
             the logp value for the prior at given sample
         """
-        val = float(val)
+        # val = float(val) # TODO: remove if OK?
         self.dist.requested_parameters[self.name] = val
-        
+
         if self.dist.filled_request():
             # all required parameters have been set
             values = list(self.dist.requested_parameters.values())
-            
+
             # check for the same number of values for each parameter
             for i in range(len(self.dist) - 1):
                 if isinstance(values[i], (list, np.ndarray)) or isinstance(
@@ -1532,7 +1584,7 @@ class NFPriorConditional(JointPrior):
 
             lnp = np.atleast_1d(self.dist.ln_prob(np.asarray(values).T).squeeze())
             lnp = float(lnp)
-            
+
             # reset the requested parameters
             self.dist.reset_request()
             return lnp
@@ -1551,340 +1603,3 @@ class NFPriorConditional(JointPrior):
 
                 ret = np.zeros_like(val)
                 return ret
-
-
-class ConditionalGWPriorLoader:
-    """
-    Hybrid conditional/individual prior system for gravitational wave inference.
-    All conditional parameter bounds must be specified in the prior file which is passed to this class to properly handle the conditional normalizing flow.
-    
-    This class combines:
-    - Conditional NF for 5 parameters: ["chirp_mass", "mass_ratio", "luminosity_distance", "lambda_1", "lambda_2"]
-    - Individual priors for all other parameters from a bilby prior file
-    
-    Usage:
-        loader = ConditionalGWPriorLoader(
-            prior_file_path="GW190425/common.prior",
-            nf_model_path="conditional_bns/model.pt"
-        )
-        
-        # Example prior file must contain conditional parameters:
-        # chirp_mass = Uniform(minimum=1.485, maximum=1.490, name="chirp_mass")
-        # mass_ratio = Uniform(minimum=0.25, maximum=1.0, name="mass_ratio") 
-        # luminosity_distance = UniformComovingVolume(minimum=1.0, maximum=500.0, name='luminosity_distance')
-        # geocent_time = Uniform(minimum=1240215503.017147-0.1, maximum=1240215503.017147+0.1, name='geocent_time')
-        # a_1 = Uniform(minimum=0.0, maximum=0.05, name='a_1')
-        # ...
-        
-        # Bilby integration
-        def prior_transform(unit_cube): return loader.rescale(unit_cube)
-        def log_prior(parameters): return loader.ln_prob(parameters)
-    """
-    
-    def __init__(self, prior_file_path, nf_model_path):
-        """
-        Initialize the hybrid conditional/individual prior system.
-        
-        Parameters:
-        -----------
-        prior_file_path : str
-            Path to bilby prior file (*.prior) containing ALL parameter priors.
-            Must include conditional parameters: chirp_mass, mass_ratio, luminosity_distance
-            Example conditional parameter definitions:
-            - chirp_mass = Uniform(minimum=1.485, maximum=1.490, name="chirp_mass")
-            - mass_ratio = Uniform(minimum=0.25, maximum=1.0, name="mass_ratio")
-            - luminosity_distance = UniformComovingVolume(minimum=1.0, maximum=500.0, name='luminosity_distance')
-        nf_model_path : str
-            Path to conditional normalizing flow model (.pt file)
-        
-        Raises:
-        -------
-        ValueError
-            If any conditional parameters are missing from the prior file
-        """
-        # import importlib.util # TODO: remove me if OK without it
-        from bilby.core.prior import PriorDict
-        
-        self.prior_file_path = prior_file_path
-        self.nf_model_path = nf_model_path
-        
-        # Conditional parameters (handled by normalizing flow)
-        self.conditional_params = ["chirp_mass", "mass_ratio", "luminosity_distance", "lambda_1", "lambda_2"]
-        
-        # Parse prior file and extract individual priors
-        self.individual_priors, self.conditional_bounds = self._parse_prior_file()
-        
-        # Validate that all conditional parameters have bounds from prior file
-        self._validate_conditional_bounds()
-        
-        # Create conditional NF distribution
-        self.conditional_dist = NFDistConditional(
-            names=self.conditional_params,
-            flow_filename=nf_model_path,
-            Mc_bounds=self.conditional_bounds.get("chirp_mass"),
-            q_bounds=self.conditional_bounds.get("mass_ratio"),
-            dL_bounds=self.conditional_bounds.get("luminosity_distance")
-        )
-        
-        # Create PriorDict for individual parameters
-        self.individual_prior_dict = PriorDict(self.individual_priors)
-        
-        # Total parameter count and ordering
-        self.all_param_names = self.conditional_params + list(self.individual_priors.keys())
-        self.n_conditional = len(self.conditional_params)
-        self.n_individual = len(self.individual_priors)
-        self.n_total = self.n_conditional + self.n_individual
-        
-        print(f"ConditionalGWPriorLoader initialized:")
-        print(f"  Conditional parameters ({self.n_conditional}): {self.conditional_params}")
-        print(f"  Individual parameters ({self.n_individual}): {list(self.individual_priors.keys())}")
-        print(f"  Total parameters: {self.n_total}")
-    
-    def _parse_prior_file(self):
-        """
-        Safely parse bilby prior file and extract individual priors.
-        
-        Returns:
-        --------
-        individual_priors : dict
-            Dictionary of individual prior objects (not conditional parameters)
-        conditional_bounds : dict
-            Extracted bounds for conditional parameters found in prior file
-        """
-        import numpy as np
-        from bilby.core.prior.analytical import Uniform, Sine, Cosine
-        from bilby.gw.prior import UniformComovingVolume
-        
-        # Create safe namespace for executing prior file
-        safe_globals = {
-            '__builtins__': {
-                'abs': abs, 'min': min, 'max': max, 'round': round,
-                'int': int, 'float': float, 'str': str, 'bool': bool,
-                'len': len, 'range': range, 'enumerate': enumerate,
-                'zip': zip, 'map': map, 'filter': filter, 'sum': sum,
-                'any': any, 'all': all, 'sorted': sorted, 'list': list,
-                'dict': dict, 'tuple': tuple, 'set': set
-            },
-            'np': np,
-            'Uniform': Uniform,
-            'Sine': Sine, 
-            'Cosine': Cosine,
-            'UniformComovingVolume': UniformComovingVolume
-        }
-        
-        # Execute prior file
-        local_vars = {}
-        try:
-            with open(self.prior_file_path, 'r') as f:
-                prior_code = f.read()
-            exec(prior_code, safe_globals, local_vars)
-        except Exception as e:
-            raise RuntimeError(f"Failed to parse prior file {self.prior_file_path}: {e}")
-        
-        # Extract priors and bounds
-        individual_priors = {}
-        conditional_bounds = {}
-        
-        for var_name, var_value in local_vars.items():
-            if hasattr(var_value, 'minimum') and hasattr(var_value, 'maximum'):
-                # This is a prior object
-                if var_name in self.conditional_params:
-                    # Extract bounds for conditional parameters
-                    conditional_bounds[var_name] = (var_value.minimum, var_value.maximum)
-                else:
-                    # Keep as individual prior
-                    individual_priors[var_name] = var_value
-        
-        return individual_priors, conditional_bounds
-    
-    def _validate_conditional_bounds(self):
-        """Ensure all conditional parameters have bounds defined in the prior file."""
-        
-        # Required conditional parameters (lambda_1, lambda_2 are generated by NF, no bounds needed)
-        required_params = ["chirp_mass", "mass_ratio", "luminosity_distance"]
-        missing_params = []
-        
-        for param in required_params:
-            if param not in self.conditional_bounds:
-                missing_params.append(param)
-        
-        if missing_params:
-            raise ValueError(
-                f"Missing conditional parameters in prior file: {missing_params}\n"
-                f"The prior file must contain bounds for all conditional parameters.\n"
-                f"Example definitions needed:\n"
-                f"  chirp_mass = Uniform(minimum=1.485, maximum=1.490, name='chirp_mass')\n"
-                f"  mass_ratio = Uniform(minimum=0.25, maximum=1.0, name='mass_ratio')\n"
-                f"  luminosity_distance = UniformComovingVolume(minimum=1.0, maximum=500.0, name='luminosity_distance')"
-            )
-    
-    def rescale(self, unit_cube):
-        """
-        Transform from unit hypercube to parameter space.
-        
-        Parameters:
-        -----------
-        unit_cube : array_like
-            Array of shape (n_total,) or (n_samples, n_total) with values in [0,1]
-        
-        Returns:
-        --------
-        parameters : np.ndarray
-            Rescaled parameters with shape matching input
-        """
-        unit_cube = np.asarray(unit_cube)
-        
-        # Handle both single sample and batch
-        if unit_cube.ndim == 1:
-            unit_cube = unit_cube.reshape(1, -1)
-            single_sample = True
-        else:
-            single_sample = False
-        
-        n_samples = unit_cube.shape[0]
-        
-        # Split unit cube: first n_conditional for conditional, rest for individual
-        conditional_unit = unit_cube[:, :self.n_conditional]
-        individual_unit = unit_cube[:, self.n_conditional:]
-        
-        # Rescale conditional parameters
-        conditional_rescaled = self.conditional_dist.rescale(conditional_unit)
-        
-        # Ensure conditional_rescaled is 2D
-        if conditional_rescaled.ndim == 1:
-            conditional_rescaled = conditional_rescaled.reshape(1, -1)
-        
-        # Rescale individual parameters
-        if self.n_individual > 0:
-            individual_rescaled = np.zeros((n_samples, self.n_individual))
-            individual_param_names = list(self.individual_priors.keys())
-            
-            for i, sample_unit in enumerate(individual_unit):
-                individual_list = self.individual_prior_dict.rescale(individual_param_names, sample_unit)
-                individual_rescaled[i] = individual_list
-        else:
-            individual_rescaled = np.empty((n_samples, 0))
-        
-        # Combine results
-        all_rescaled = np.column_stack([conditional_rescaled, individual_rescaled])
-        
-        # Return original shape
-        if single_sample:
-            return all_rescaled.squeeze(0)
-        else:
-            return all_rescaled
-    
-    def ln_prob(self, parameters):
-        """
-        Evaluate log probability for parameters.
-        
-        Parameters:
-        -----------
-        parameters : array_like
-            Parameters with shape (n_total,) or (n_samples, n_total)
-        
-        Returns:
-        --------
-        ln_prob : float or np.ndarray
-            Log probability values
-        """
-        parameters = np.asarray(parameters)
-        
-        # Handle both single sample and batch
-        if parameters.ndim == 1:
-            parameters = parameters.reshape(1, -1)
-            single_sample = True
-        else:
-            single_sample = False
-        
-        n_samples = parameters.shape[0]
-        
-        # Split parameters: first n_conditional for conditional, rest for individual
-        conditional_params = parameters[:, :self.n_conditional]
-        individual_params = parameters[:, self.n_conditional:]
-        
-        # Evaluate conditional log probability
-        conditional_ln_prob = self.conditional_dist.ln_prob(conditional_params)
-        
-        # Evaluate individual log probabilities
-        if self.n_individual > 0:
-            individual_ln_prob = np.zeros(n_samples)
-            individual_param_names = list(self.individual_priors.keys())
-            
-            for i, sample_params in enumerate(individual_params):
-                individual_dict = {name: sample_params[j] for j, name in enumerate(individual_param_names)}
-                individual_ln_prob[i] = self.individual_prior_dict.ln_prob(individual_dict)
-        else:
-            individual_ln_prob = np.zeros(n_samples)
-        
-        # Sum log probabilities
-        total_ln_prob = conditional_ln_prob + individual_ln_prob
-        
-        # Return original shape
-        if single_sample:
-            return float(total_ln_prob.squeeze(0))
-        else:
-            return total_ln_prob
-    
-    def sample(self, size=1):
-        """
-        Generate samples from the hybrid prior.
-        
-        Parameters:
-        -----------
-        size : int
-            Number of samples to generate
-        
-        Returns:
-        --------
-        samples : dict
-            Dictionary with parameter names as keys and sample arrays as values
-        """
-        # Sample from conditional distribution
-        self.conditional_dist.sample(size=size)
-        conditional_samples = self.conditional_dist.current_sample
-        
-        # Sample from individual priors
-        if self.n_individual > 0:
-            individual_samples = self.individual_prior_dict.sample(size)
-        else:
-            individual_samples = {}
-        
-        # Combine samples
-        all_samples = {**conditional_samples, **individual_samples}
-        
-        return all_samples
-
-
-class ConditionalPriorDict:
-    """
-    A PriorDict-compatible wrapper for ConditionalGWPriorLoader.
-    This allows the conditional prior system to work seamlessly with bilby's sampling.
-    This is just a wrapper around ConditionalGWPriorLoader to make it compatible with bilby's prior system.
-    """
-    
-    def __init__(self, loader):
-        self.loader = loader
-        self.keys = loader.all_param_names
-        
-    def rescale(self, keys, unit_cube):
-        """Rescale from unit hypercube to parameter space"""
-        return self.loader.rescale(unit_cube)
-        
-    def ln_prob(self, parameters_dict):
-        """Evaluate log probability for parameters"""
-        # Extract parameter values in the correct order
-        param_array = [parameters_dict[key] for key in self.keys]
-        return self.loader.ln_prob(param_array)
-        
-    def __len__(self):
-        """Return total number of parameters"""
-        return self.loader.n_total
-        
-    def __getitem__(self, key):
-        """Allow bilby to access individual priors if needed"""
-        return self
-        
-    def sample(self, size=1):
-        """Generate samples from the hybrid prior"""
-        return self.loader.sample(size)

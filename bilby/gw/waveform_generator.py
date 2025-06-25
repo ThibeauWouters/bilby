@@ -232,8 +232,10 @@ class WaveformGenerator(object):
             raise TypeError('"parameters" must be a dictionary.')
         new_parameters = parameters.copy()
         new_parameters, _ = self.parameter_conversion(new_parameters)
-        for key in self.source_parameter_keys.symmetric_difference(
-                new_parameters):
+        # Only remove parameters that are in new_parameters but not in source_parameter_keys
+        # Don't remove parameters that are in source_parameter_keys but not in new_parameters
+        keys_to_remove = set(new_parameters.keys()) - self.source_parameter_keys
+        for key in keys_to_remove:
             new_parameters.pop(key)
         self.__parameters = new_parameters
         self.__parameters.update(self.waveform_arguments)
