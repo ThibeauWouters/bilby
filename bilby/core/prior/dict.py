@@ -873,7 +873,7 @@ class ConditionalPriorDict(PriorDict):
         samples = []
         for key in keys:
             samples += list(np.asarray(result[key]).flatten())
-        return samples
+        return np.array(samples)
 
     def _update_rescale_keys(self, keys):
         if not keys == self._least_recently_rescaled_keys:
@@ -1012,28 +1012,74 @@ class NFConditionalPrior(Prior):
         with open(kwargs_file, "r") as f:
             kwargs = json.load(f)
             
-        # Validate model configuration
-        if kwargs["names"] != ["lambda_1", "lambda_2"]:
-            raise ValueError(f"Expected NF model for ['lambda_1', 'lambda_2'], got {kwargs['names']}")
-        if kwargs["names_conditional"] != ["m_1", "m_2"]:
-            raise ValueError(f"Expected NF conditioning on ['m_1', 'm_2'], got {kwargs['names_conditional']}")
+        # Validate model configuration and determine source type
+        supported_configs = {
+            "bns": {
+                "names": ["lambda_1", "lambda_2"],
+                "names_conditional": ["m_1", "m_2"],
+                "n_inputs": 2,
+                "n_conditional_inputs": 2
+            },
+            "nsbh": {
+                "names": ["lambda_2"],
+                "names_conditional": ["m_2"],
+                "n_inputs": 1,
+                "n_conditional_inputs": 1
+            }
+        }
+        
+        # Determine source type from model configuration
+        self.source_type = None
+        for src_type, config in supported_configs.items():
+            if (kwargs["names"] == config["names"] and 
+                kwargs["names_conditional"] == config["names_conditional"]):
+                self.source_type = src_type
+                break
+                
+        if self.source_type is None:
+            raise ValueError(
+                f"Unsupported model configuration: names={kwargs['names']}, "
+                f"names_conditional={kwargs['names_conditional']}. "
+                f"Supported configurations: {supported_configs}"
+            )
             
-        # Load the flow model
-        self.nf = RealNVP(
-            n_inputs=2,
-            n_conditional_inputs=2,
-            n_transforms=kwargs["n_transforms"],
-            n_neurons=kwargs["n_neurons"],
-            n_blocks_per_transform=kwargs["n_blocks_per_transform"],
-            batch_norm_between_transforms=True
-        )
+        logger.info(f"Detected {self.source_type} model configuration for NF prior.")
+            
+        # Load the appropriate flow model based on source type
+        config = supported_configs[self.source_type]
+        
+        if self.source_type == "bns":
+            from glasflow.flows import RealNVP
+            self.nf = RealNVP(
+                n_inputs=config["n_inputs"],
+                n_conditional_inputs=config["n_conditional_inputs"],
+                n_transforms=kwargs["n_transforms"],
+                n_neurons=kwargs["n_neurons"],
+                n_blocks_per_transform=kwargs["n_blocks_per_transform"],
+                batch_norm_between_transforms=True
+            )
+        elif self.source_type == "nsbh":
+            from glasflow.flows.autoregressive import MaskedAffineAutoregressiveFlow
+            self.nf = MaskedAffineAutoregressiveFlow(
+                n_inputs=config["n_inputs"],
+                n_conditional_inputs=config["n_conditional_inputs"],
+                n_transforms=kwargs["n_transforms"],
+                n_neurons=kwargs["n_neurons"],
+                n_blocks_per_transform=kwargs["n_blocks_per_transform"]
+            )
         self.nf.load_state_dict(torch.load(nf_model_path, map_location="cpu"))
         self.nf.eval()
         
         # Store configuration
         self.nf_model_path = nf_model_path
         self.target_param = target_param
-        self.target_index = 0 if target_param == 'lambda_1' else 1
+        self.take_log_lambda = kwargs.get("take_log_lambda", "False") == "True"
+        
+        # Set target index for BNS case
+        if self.source_type == "bns":
+            self.target_index = 0 if target_param == 'lambda_1' else 1
+        else:  # NSBH case - always lambda_2
+            self.target_index = 0  # Single dimension output
         
         # Initialize the base prior (we override the key methods)
         super().__init__(
@@ -1045,8 +1091,18 @@ class NFConditionalPrior(Prior):
             maximum=maximum
         )
         
-        # Set required variables for ConditionalPriorDict
+        # Set required variables for ConditionalPriorDict based on source type
         self.required_variables = ['chirp_mass', 'mass_ratio', 'luminosity_distance']
+        
+        # Bind source-type-specific methods for efficiency
+        if self.source_type == "bns":
+            self.sample = self._sample_bns
+            self.rescale = self._rescale_bns
+            self.ln_prob = self._ln_prob_bns
+        else:  # NSBH
+            self.sample = self._sample_nsbh
+            self.rescale = self._rescale_nsbh
+            self.ln_prob = self._ln_prob_nsbh
         
     def _convert_to_source_masses(self, chirp_mass, mass_ratio, dL):
         """Convert detector-frame parameters to source-frame masses"""
@@ -1058,8 +1114,8 @@ class NFConditionalPrior(Prior):
         mc_source = chirp_mass / (1 + z)
         return chirp_mass_and_mass_ratio_to_component_masses(mc_source, mass_ratio)
         
-    def sample(self, size=None, **required_variables):
-        """Sample from the conditional NF distribution"""
+    def _sample_bns(self, size=None, **required_variables):
+        """Sample from BNS conditional NF distribution"""
         import torch
         import numpy as np
         
@@ -1099,8 +1155,51 @@ class NFConditionalPrior(Prior):
         self.least_recently_sampled = result
         return result
         
-    def rescale(self, val, **required_variables):
-        """Rescale from unit hypercube using inverse NF transform"""
+    def _sample_nsbh(self, size=None, **required_variables):
+        """Sample from NSBH conditional NF distribution"""
+        import torch
+        import numpy as np
+        
+        # Check for required variables
+        if not all(var in required_variables for var in self.required_variables):
+            missing = [var for var in self.required_variables if var not in required_variables]
+            raise ValueError(f"Missing required variables: {missing}")
+        
+        # Extract required variables
+        chirp_mass = required_variables['chirp_mass']
+        mass_ratio = required_variables['mass_ratio']
+        dL = required_variables['luminosity_distance']
+        
+        # Convert to source masses and extract NS mass (m2)
+        _, m2 = self._convert_to_source_masses(chirp_mass, mass_ratio, dL)
+        
+        # Handle vectorized inputs
+        if np.isscalar(chirp_mass):
+            batch_size = 1 if size is None else size
+            m2 = np.full(batch_size, m2)
+        else:
+            batch_size = len(chirp_mass)
+            
+        # Sample from NF - NSBH model expects 1D conditioning on m_2
+        with torch.inference_mode():
+            cond = torch.tensor(m2.reshape(-1, 1), dtype=torch.float32)
+            lambdas = self.nf.sample(batch_size, conditional=cond).cpu().numpy()
+            
+            # For NSBH, convert from log space and enforce bounds
+            if hasattr(self, 'take_log_lambda') and self.take_log_lambda:
+                target_values = np.exp(lambdas.flatten())
+            else:
+                target_values = lambdas.flatten()
+                
+            target_values = np.maximum(0.0, target_values)
+            target_values = np.clip(target_values, self.minimum, self.maximum)
+            
+        result = target_values[0] if batch_size == 1 else target_values
+        self.least_recently_sampled = result
+        return result
+        
+    def _rescale_bns(self, val, **required_variables):
+        """Rescale from unit hypercube using inverse NF transform for BNS"""
         import torch
         import numpy as np
         from scipy.stats import norm
@@ -1149,8 +1248,52 @@ class NFConditionalPrior(Prior):
             
         return target_values[0] if len(target_values) == 1 else target_values
         
-    def ln_prob(self, val, **required_variables):
-        """Compute log probability using the NF"""
+    def _rescale_nsbh(self, val, **required_variables):
+        """Rescale from unit hypercube using inverse NF transform for NSBH"""
+        import torch
+        import numpy as np
+        from scipy.stats import norm
+        
+        # Check for required variables
+        if not all(var in required_variables for var in self.required_variables):
+            return super().rescale(val)  # Fallback to uniform rescaling
+        
+        # Extract required variables
+        chirp_mass = required_variables['chirp_mass']
+        mass_ratio = required_variables['mass_ratio']  
+        dL = required_variables['luminosity_distance']
+        
+        # Convert to source masses and extract NS mass (m2)
+        _, m2 = self._convert_to_source_masses(chirp_mass, mass_ratio, dL)
+        
+        # Handle vectorized inputs
+        val = np.atleast_1d(val)
+        if np.isscalar(chirp_mass):
+            m2 = np.full(len(val), m2)
+        
+        with torch.inference_mode():
+            # Convert uniform samples to standard normal
+            normal_samples = norm.ppf(np.clip(val, 1e-10, 1-1e-10))
+            normal_tensor = torch.tensor(normal_samples.reshape(-1, 1), dtype=torch.float32)
+            cond = torch.tensor(m2.reshape(-1, 1), dtype=torch.float32)
+            
+            # Use NF inverse transform
+            lambdas, _ = self.nf.inverse(normal_tensor, conditional=cond)
+            lambdas = lambdas.cpu().numpy().flatten()
+            
+            # Convert from log space if needed and enforce bounds
+            if self.take_log_lambda:
+                target_values = np.exp(lambdas)
+            else:
+                target_values = lambdas
+                
+            target_values = np.maximum(0.0, target_values)
+            target_values = np.clip(target_values, self.minimum, self.maximum)
+            
+        return target_values[0] if len(target_values) == 1 else target_values
+        
+    def _ln_prob_bns(self, val, **required_variables):
+        """Compute log probability using the BNS NF"""
         import torch
         import numpy as np
         
@@ -1194,6 +1337,54 @@ class NFConditionalPrior(Prior):
             joint_logp = self.nf.log_prob(x, conditional=cond).cpu().numpy()
             
         return joint_logp[0] if len(joint_logp) == 1 else joint_logp
+        
+    def _ln_prob_nsbh(self, val, **required_variables):
+        """Compute log probability using the NSBH NF"""
+        import torch
+        import numpy as np
+        
+        # Check bounds first
+        val = np.atleast_1d(val)
+        out_of_bounds = (val < self.minimum) | (val > self.maximum)
+        if np.any(out_of_bounds):
+            return np.full_like(val, -np.inf, dtype=float)
+            
+        # Check for required variables
+        if not all(var in required_variables for var in self.required_variables):
+            return np.zeros_like(val, dtype=float)  # Return neutral log prob
+        
+        # Extract required variables
+        chirp_mass = required_variables['chirp_mass']
+        mass_ratio = required_variables['mass_ratio']
+        dL = required_variables['luminosity_distance']
+        
+        # Convert to source masses and extract NS mass (m2)
+        _, m2 = self._convert_to_source_masses(chirp_mass, mass_ratio, dL)
+        
+        # Handle vectorized inputs
+        if np.isscalar(chirp_mass):
+            m2 = np.full(len(val), m2)
+            
+        with torch.inference_mode():
+            # Convert to log space if needed
+            if self.take_log_lambda:
+                x_input = np.log(np.maximum(val, 1e-10))  # Avoid log(0)
+            else:
+                x_input = val
+                
+            x = torch.tensor(x_input.reshape(-1, 1), dtype=torch.float32)
+            cond = torch.tensor(m2.reshape(-1, 1), dtype=torch.float32)
+            
+            # Get log prob from NF
+            logp = self.nf.log_prob(x, conditional=cond).cpu().numpy()
+            
+            # Apply Jacobian correction if we took log of lambda
+            if self.take_log_lambda:
+                # d(log(lambda))/d(lambda) = 1/lambda
+                jacobian_correction = -np.log(np.maximum(val, 1e-10))
+                logp += jacobian_correction
+            
+        return logp[0] if len(logp) == 1 else logp
         
     def prob(self, val, **required_variables):
         """Return the prior probability"""
