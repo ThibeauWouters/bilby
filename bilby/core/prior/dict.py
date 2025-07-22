@@ -16,6 +16,15 @@ from ..utils import (
     decode_bilby_json,
 )
 
+# TODO: This is for the NF priors -- might have to replace this in a separate file, for now, keep it here
+from bilby.gw.conversion import (
+            luminosity_distance_to_redshift,
+            chirp_mass_and_mass_ratio_to_component_masses
+        )
+import torch
+from scipy.stats import norm
+from glasflow.flows import RealNVP
+from glasflow.flows.autoregressive import MaskedAffineAutoregressiveFlow
 
 class PriorDict(dict):
     def __init__(self, dictionary=None, filename=None, conversion_function=None):
@@ -999,11 +1008,6 @@ class NFConditionalPrior(Prior):
         maximum: float
             Maximum value for the parameter
         """
-        import os
-        import json
-        import torch
-        from glasflow.flows import RealNVP
-        
         # Load the NF model
         if not os.path.isfile(nf_model_path):
             raise FileNotFoundError(f"NF model file {nf_model_path} does not exist.")
@@ -1049,7 +1053,6 @@ class NFConditionalPrior(Prior):
         config = supported_configs[self.source_type]
         
         if self.source_type == "bns":
-            from glasflow.flows import RealNVP
             self.nf = RealNVP(
                 n_inputs=config["n_inputs"],
                 n_conditional_inputs=config["n_conditional_inputs"],
@@ -1059,7 +1062,6 @@ class NFConditionalPrior(Prior):
                 batch_norm_between_transforms=True
             )
         elif self.source_type == "nsbh":
-            from glasflow.flows.autoregressive import MaskedAffineAutoregressiveFlow
             self.nf = MaskedAffineAutoregressiveFlow(
                 n_inputs=config["n_inputs"],
                 n_conditional_inputs=config["n_conditional_inputs"],
@@ -1099,25 +1101,19 @@ class NFConditionalPrior(Prior):
             self.sample = self._sample_bns
             self.rescale = self._rescale_bns
             self.ln_prob = self._ln_prob_bns
-        else:  # NSBH
+        else:
             self.sample = self._sample_nsbh
             self.rescale = self._rescale_nsbh
             self.ln_prob = self._ln_prob_nsbh
         
     def _convert_to_source_masses(self, chirp_mass, mass_ratio, dL):
         """Convert detector-frame parameters to source-frame masses"""
-        from bilby.gw.conversion import (
-            luminosity_distance_to_redshift,
-            chirp_mass_and_mass_ratio_to_component_masses
-        )
         z = luminosity_distance_to_redshift(dL)
         mc_source = chirp_mass / (1 + z)
         return chirp_mass_and_mass_ratio_to_component_masses(mc_source, mass_ratio)
         
     def _sample_bns(self, size=None, **required_variables):
         """Sample from BNS conditional NF distribution"""
-        import torch
-        import numpy as np
         
         # Check for required variables
         if not all(var in required_variables for var in self.required_variables):
@@ -1148,8 +1144,9 @@ class NFConditionalPrior(Prior):
             # Extract target parameter and enforce positivity
             target_values = np.maximum(0.0, lambdas[:, self.target_index])
             
-            # Enforce bounds
-            target_values = np.clip(target_values, self.minimum, self.maximum)
+            # FIXME: not done here for prob reasons, using the constraint priors for that
+            # # Enforce bounds
+            # target_values = np.clip(target_values, self.minimum, self.maximum)
             
         result = target_values[0] if batch_size == 1 else target_values
         self.least_recently_sampled = result
@@ -1157,8 +1154,6 @@ class NFConditionalPrior(Prior):
         
     def _sample_nsbh(self, size=None, **required_variables):
         """Sample from NSBH conditional NF distribution"""
-        import torch
-        import numpy as np
         
         # Check for required variables
         if not all(var in required_variables for var in self.required_variables):
@@ -1191,8 +1186,9 @@ class NFConditionalPrior(Prior):
             else:
                 target_values = lambdas.flatten()
                 
-            target_values = np.maximum(0.0, target_values)
-            target_values = np.clip(target_values, self.minimum, self.maximum)
+            # FIXME: doing this in constraints
+            # target_values = np.maximum(0.0, target_values)
+            # target_values = np.clip(target_values, self.minimum, self.maximum)
             
         result = target_values[0] if batch_size == 1 else target_values
         self.least_recently_sampled = result
@@ -1200,9 +1196,6 @@ class NFConditionalPrior(Prior):
         
     def _rescale_bns(self, val, **required_variables):
         """Rescale from unit hypercube using inverse NF transform for BNS"""
-        import torch
-        import numpy as np
-        from scipy.stats import norm
         
         # Check for required variables
         if not all(var in required_variables for var in self.required_variables):
@@ -1243,16 +1236,15 @@ class NFConditionalPrior(Prior):
             
             # Extract target parameter and enforce bounds
             target_values = lambdas[:, self.target_index]
-            target_values = np.maximum(0.0, target_values)
-            target_values = np.clip(target_values, self.minimum, self.maximum)
+            
+            # FIXME: doing this with constraints
+            # target_values = np.maximum(0.0, target_values)
+            # target_values = np.clip(target_values, self.minimum, self.maximum)
             
         return target_values[0] if len(target_values) == 1 else target_values
         
     def _rescale_nsbh(self, val, **required_variables):
         """Rescale from unit hypercube using inverse NF transform for NSBH"""
-        import torch
-        import numpy as np
-        from scipy.stats import norm
         
         # Check for required variables
         if not all(var in required_variables for var in self.required_variables):
@@ -1287,25 +1279,26 @@ class NFConditionalPrior(Prior):
             else:
                 target_values = lambdas
                 
-            target_values = np.maximum(0.0, target_values)
-            target_values = np.clip(target_values, self.minimum, self.maximum)
+            # FIXME: doing this with constraints
+            # target_values = np.maximum(0.0, target_values)
+            # target_values = np.clip(target_values, self.minimum, self.maximum)
             
         return target_values[0] if len(target_values) == 1 else target_values
         
     def _ln_prob_bns(self, val, **required_variables):
         """Compute log probability using the BNS NF"""
-        import torch
-        import numpy as np
         
-        # Check bounds first
-        val = np.atleast_1d(val)
-        out_of_bounds = (val < self.minimum) | (val > self.maximum)
-        if np.any(out_of_bounds):
-            return np.full_like(val, -np.inf, dtype=float)
+        # FIXME: doing this in constraints
+        # # Check bounds first
+        # val = np.atleast_1d(val)
+        # out_of_bounds = (val < self.minimum) | (val > self.maximum)
+        # if np.any(out_of_bounds):
+        #     return np.full_like(val, -np.inf, dtype=float)
             
-        # Check for required variables
-        if not all(var in required_variables for var in self.required_variables):
-            return np.zeros_like(val, dtype=float)  # Return neutral log prob
+        # TODO: check if this is necessary or if fails?
+        # # Check for required variables
+        # if not all(var in required_variables for var in self.required_variables):
+        #     return np.zeros_like(val, dtype=float)  # Return neutral log prob
         
         # Extract required variables
         chirp_mass = required_variables['chirp_mass']
@@ -1340,18 +1333,18 @@ class NFConditionalPrior(Prior):
         
     def _ln_prob_nsbh(self, val, **required_variables):
         """Compute log probability using the NSBH NF"""
-        import torch
-        import numpy as np
         
-        # Check bounds first
-        val = np.atleast_1d(val)
-        out_of_bounds = (val < self.minimum) | (val > self.maximum)
-        if np.any(out_of_bounds):
-            return np.full_like(val, -np.inf, dtype=float)
+        # FIXME: doing this in constraints
+        # # Check bounds first
+        # val = np.atleast_1d(val)
+        # out_of_bounds = (val < self.minimum) | (val > self.maximum)
+        # if np.any(out_of_bounds):
+        #     return np.full_like(val, -np.inf, dtype=float)
             
-        # Check for required variables
-        if not all(var in required_variables for var in self.required_variables):
-            return np.zeros_like(val, dtype=float)  # Return neutral log prob
+        # TODO: check if this is necessary or if fails?
+        # # Check for required variables
+        # if not all(var in required_variables for var in self.required_variables):
+        #     return np.zeros_like(val, dtype=float)  # Return neutral log prob
         
         # Extract required variables
         chirp_mass = required_variables['chirp_mass']
@@ -1373,7 +1366,7 @@ class NFConditionalPrior(Prior):
                 x_input = val
                 
             x = torch.tensor(x_input.reshape(-1, 1), dtype=torch.float32)
-            cond = torch.tensor(m2.reshape(-1, 1), dtype=torch.float32)
+            cond = torch.tensor(m2.to_numpy().reshape(-1, 1), dtype=torch.float32)
             
             # Get log prob from NF
             logp = self.nf.log_prob(x, conditional=cond).cpu().numpy()
