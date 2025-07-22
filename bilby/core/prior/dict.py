@@ -983,7 +983,8 @@ class NFConditionalPrior(Prior):
     """
     
     def __init__(self, nf_model_path, target_param, name=None, latex_label=None, 
-                 unit=None, boundary=None, minimum=0.0, maximum=10000.0):
+                 unit=None, boundary=None, minimum=0.0, maximum=10000.0,
+                 shared_lambda_state=None):
         """
         Parameters
         ==========
@@ -1003,6 +1004,8 @@ class NFConditionalPrior(Prior):
             Minimum value for the parameter
         maximum: float
             Maximum value for the parameter
+        shared_lambda_state: dict, optional
+            Shared state dictionary for coordination between lambda_1 and lambda_2 priors
         """
         # Load the NF model
         if not os.path.isfile(nf_model_path):
@@ -1072,6 +1075,7 @@ class NFConditionalPrior(Prior):
         self.nf_model_path = nf_model_path
         self.target_param = target_param
         self.take_log_lambda = kwargs.get("take_log_lambda", "False") == "True"
+        self.shared_lambda_state = shared_lambda_state
         
         # Set target index for BNS case
         if self.source_type == "bns":
@@ -1113,7 +1117,7 @@ class NFConditionalPrior(Prior):
         return chirp_mass_and_mass_ratio_to_component_masses(mc_source, mass_ratio)
         
     def _sample_bns(self, size=None, **required_variables):
-        """Sample from BNS conditional NF distribution"""
+        """Sample from BNS conditional NF distribution with shared state coordination"""
         
         # Check for required variables
         if not all(var in required_variables for var in self.required_variables):
@@ -1124,6 +1128,33 @@ class NFConditionalPrior(Prior):
         chirp_mass = required_variables['chirp_mass']
         mass_ratio = required_variables['mass_ratio']
         dL = required_variables['luminosity_distance']
+        
+        # Check if we have shared state and if values are already available
+        if self.shared_lambda_state is not None:
+            # Create a key for current conditioning variables to check if we need fresh samples
+            current_conditioning = (float(chirp_mass), float(mass_ratio), float(dL))
+            
+            # Debug logging
+            logger.debug(f"[{self.target_param}] Current conditioning: {current_conditioning}")
+            logger.debug(f"[{self.target_param}] Shared state before: {self.shared_lambda_state}")
+            
+            # Check if conditioning variables have changed
+            last_conditioning = self.shared_lambda_state.get('_conditioning')
+            if last_conditioning != current_conditioning:
+                logger.debug(f"[{self.target_param}] Conditioning variables changed, clearing shared state")
+                # Clear all lambda values but keep the conditioning info
+                self.shared_lambda_state['lambda_1'] = None
+                self.shared_lambda_state['lambda_2'] = None
+                self.shared_lambda_state['_conditioning'] = current_conditioning
+            
+            # If this target parameter already has a value, return it
+            if self.shared_lambda_state.get(self.target_param) is not None:
+                logger.debug(f"[{self.target_param}] Using existing value from shared state")
+                result = self.shared_lambda_state[self.target_param]
+                self.least_recently_sampled = result
+                return result
+            
+            logger.debug(f"[{self.target_param}] No existing value, will generate new joint sample")
         
         # Convert to source masses
         m1, m2 = self._convert_to_source_masses(chirp_mass, mass_ratio, dL)
@@ -1136,23 +1167,32 @@ class NFConditionalPrior(Prior):
         else:
             batch_size = len(chirp_mass)
             
-        # Sample from NF
+        # Sample joint lambdas from NF
         with torch.inference_mode():
             cond = torch.tensor(np.column_stack([m1, m2]), dtype=torch.float32)
             lambdas = self.nf.sample(batch_size, conditional=cond).cpu().numpy()
             
-            # Extract the desired lambdas using the target index
-            lambdas = lambdas[:, self.target_index]
-            
-            # Convert from log space and enforce bounds
+            # Convert from log space
             if self.take_log_lambda:
-                target_values = np.exp(lambdas.flatten())
-            else:
-                target_values = lambdas.flatten()
+                lambdas = np.exp(lambdas)
+            
+            # Store both lambda values in shared state if available
+            if self.shared_lambda_state is not None and batch_size == 1:
+                lambda_1_val = lambdas[0, 0]  # First component
+                lambda_2_val = lambdas[0, 1]  # Second component
+                
+                # Store both values in shared state
+                self.shared_lambda_state['lambda_1'] = float(lambda_1_val)
+                self.shared_lambda_state['lambda_2'] = float(lambda_2_val)
+                
+                logger.debug(f"Stored joint sample in shared state: lambda_1={lambda_1_val:.1f}, lambda_2={lambda_2_val:.1f}")
+            
+            # Extract the target lambda using the target index
+            target_values = lambdas[:, self.target_index]
             
             # FIXME: not done here for prob reasons, using the constraint priors for that
             # # Enforce bounds
-            # target_values = np.maximum(0.0, lambdas[:, self.target_index])
+            # target_values = np.maximum(0.0, target_values)
             # target_values = np.clip(target_values, self.minimum, self.maximum)
             
         result = target_values[0] if batch_size == 1 else target_values
@@ -1299,22 +1339,51 @@ class NFConditionalPrior(Prior):
     def _ln_prob_bns(self, val, **required_variables):
         """Compute log probability using the BNS NF"""
         
+        # Remember if input was scalar
+        is_scalar_input = np.isscalar(val)
         val = np.atleast_1d(val)
         
         # Check bounds first
         out_of_bounds = (val < self.minimum) | (val > self.maximum)
         if np.any(out_of_bounds):
-            return np.full_like(val, -np.inf, dtype=float)
+            result = np.full_like(val, -np.inf, dtype=float)
+            # Ensure scalar return for scalar input to maintain consistency with other priors
+            return float(result[0]) if is_scalar_input else result
             
-        # TODO: check if this is necessary or if fails?
-        # # Check for required variables
-        # if not all(var in required_variables for var in self.required_variables):
-        #     return np.zeros_like(val, dtype=float)  # Return neutral log prob
-        
         # Extract required variables
         chirp_mass = required_variables['chirp_mass']
         mass_ratio = required_variables['mass_ratio']
         dL = required_variables['luminosity_distance']
+        
+        # For BNS systems, coordinate with the other lambda parameter through shared state
+        other_param = 'lambda_2' if self.target_param == 'lambda_1' else 'lambda_1'
+        
+        # Store this parameter's value in shared state for coordination
+        if self.shared_lambda_state is not None:
+            self.shared_lambda_state[self.target_param] = val
+            
+        # Try to get the other lambda parameter from shared state or required_variables
+        other_lambda = None
+        if self.shared_lambda_state is not None and self.shared_lambda_state[other_param] is not None:
+            other_lambda = self.shared_lambda_state[other_param]
+        elif other_param in required_variables:
+            other_lambda = required_variables[other_param]
+            
+        if other_lambda is None:
+            # For BNS, we need both lambda values - fail explicitly
+            if self.source_type == "bns":
+                logger.warning(f"Computing ln_prob for {self.target_param} without {other_param}. "
+                              "Using marginal approximation which is not ideal for BNS systems.")
+                other_lambda = 500.0  # Typical NS lambda value
+            else:
+                # For NSBH, this is normal - only lambda_2 is used
+                other_lambda = 500.0
+                
+        # Ensure other_lambda is properly shaped
+        if np.isscalar(other_lambda):
+            other_lambda = np.full(len(val), other_lambda)
+        elif hasattr(other_lambda, '__len__') and len(other_lambda) != len(val):
+            other_lambda = np.full(len(val), other_lambda[0] if len(other_lambda) > 0 else 500.0)
         
         # Convert to source masses
         m1, m2 = self._convert_to_source_masses(chirp_mass, mass_ratio, dL)
@@ -1325,31 +1394,45 @@ class NFConditionalPrior(Prior):
             m2 = np.full(len(val), m2)
             
         with torch.inference_mode():
-            # For NF log_prob, we need both lambda values
-            # We approximate by using the target value and a reference value for the other
+            # Create lambda pairs using both actual values
             if self.target_index == 0:
-                # val is lambda_1, use a reference lambda_2 (median value)
-                lambda_pairs = np.column_stack([val, np.full(len(val), 1000.0)])
+                # val is lambda_1, other_lambda is lambda_2
+                lambda_pairs = np.column_stack([val, other_lambda])
             else:
-                # val is lambda_2, use a reference lambda_1
-                lambda_pairs = np.column_stack([np.full(len(val), 1000.0), val])
+                # val is lambda_2, other_lambda is lambda_1
+                lambda_pairs = np.column_stack([other_lambda, val])
+                
+            # Apply log transformation if needed
+            if self.take_log_lambda:
+                lambda_pairs = np.log(np.maximum(lambda_pairs, 1e-10))
                 
             x = torch.tensor(lambda_pairs, dtype=torch.float32)
             cond = torch.tensor(np.column_stack([m1, m2]), dtype=torch.float32)
             
-            # Get log prob from NF (this is the joint log prob)
+            # Get joint log prob from NF
             joint_logp = self.nf.log_prob(x, conditional=cond).cpu().numpy()
             
-        return joint_logp[0] if len(joint_logp) == 1 else joint_logp
+            # Apply Jacobian correction if we took log of lambdas
+            if self.take_log_lambda:
+                # d(log(lambda))/d(lambda) = 1/lambda for each lambda
+                jacobian_correction = -np.log(np.maximum(val, 1e-10)) - np.log(np.maximum(other_lambda, 1e-10))
+                joint_logp += jacobian_correction
+            
+        return float(joint_logp[0]) if is_scalar_input else joint_logp
         
     def _ln_prob_nsbh(self, val, **required_variables):
         """Compute log probability using the NSBH NF"""
         
-        # Check bounds first
+        # Remember if input was scalar  
+        is_scalar_input = np.isscalar(val)
         val = np.atleast_1d(val)
+        
+        # Check bounds first
         out_of_bounds = (val < self.minimum) | (val > self.maximum)
         if np.any(out_of_bounds):
-            return np.full_like(val, -np.inf, dtype=float)
+            result = np.full_like(val, -np.inf, dtype=float)
+            # Ensure scalar return for scalar input to maintain consistency with other priors
+            return float(result[0]) if is_scalar_input else result
             
         # TODO: check if this is necessary or if fails?
         # # Check for required variables
@@ -1376,7 +1459,7 @@ class NFConditionalPrior(Prior):
                 x_input = val
                 
             x = torch.tensor(x_input.reshape(-1, 1), dtype=torch.float32)
-            cond = torch.tensor(m2.to_numpy().reshape(-1, 1), dtype=torch.float32)
+            cond = torch.tensor(np.atleast_1d(m2).reshape(-1, 1), dtype=torch.float32)
             
             # Get log prob from NF
             logp = self.nf.log_prob(x, conditional=cond).cpu().numpy()
@@ -1387,7 +1470,7 @@ class NFConditionalPrior(Prior):
                 jacobian_correction = -np.log(np.maximum(val, 1e-10))
                 logp += jacobian_correction
             
-        return logp[0] if len(logp) == 1 else logp
+        return float(logp[0]) if is_scalar_input else logp
         
     def prob(self, val, **required_variables):
         """Return the prior probability"""
