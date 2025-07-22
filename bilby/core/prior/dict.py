@@ -17,10 +17,6 @@ from ..utils import (
 )
 
 # TODO: This is for the NF priors -- might have to replace this in a separate file, for now, keep it here
-from bilby.gw.conversion import (
-            luminosity_distance_to_redshift,
-            chirp_mass_and_mass_ratio_to_component_masses
-        )
 import torch
 from scipy.stats import norm
 from glasflow.flows import RealNVP
@@ -1108,6 +1104,10 @@ class NFConditionalPrior(Prior):
         
     def _convert_to_source_masses(self, chirp_mass, mass_ratio, dL):
         """Convert detector-frame parameters to source-frame masses"""
+        from bilby.gw.conversion import (
+            luminosity_distance_to_redshift,
+            chirp_mass_and_mass_ratio_to_component_masses
+        )
         z = luminosity_distance_to_redshift(dL)
         mc_source = chirp_mass / (1 + z)
         return chirp_mass_and_mass_ratio_to_component_masses(mc_source, mass_ratio)
@@ -1288,9 +1288,10 @@ class NFConditionalPrior(Prior):
     def _ln_prob_bns(self, val, **required_variables):
         """Compute log probability using the BNS NF"""
         
+        val = np.atleast_1d(val)
+        
         # FIXME: doing this in constraints
         # # Check bounds first
-        # val = np.atleast_1d(val)
         # out_of_bounds = (val < self.minimum) | (val > self.maximum)
         # if np.any(out_of_bounds):
         #     return np.full_like(val, -np.inf, dtype=float)
