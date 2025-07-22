@@ -1141,11 +1141,18 @@ class NFConditionalPrior(Prior):
             cond = torch.tensor(np.column_stack([m1, m2]), dtype=torch.float32)
             lambdas = self.nf.sample(batch_size, conditional=cond).cpu().numpy()
             
-            # Extract target parameter and enforce positivity
-            target_values = np.maximum(0.0, lambdas[:, self.target_index])
+            # Extract the desired lambdas using the target index
+            lambdas = lambdas[:, self.target_index]
+            
+            # Convert from log space and enforce bounds
+            if self.take_log_lambda:
+                target_values = np.exp(lambdas.flatten())
+            else:
+                target_values = lambdas.flatten()
             
             # FIXME: not done here for prob reasons, using the constraint priors for that
             # # Enforce bounds
+            # target_values = np.maximum(0.0, lambdas[:, self.target_index])
             # target_values = np.clip(target_values, self.minimum, self.maximum)
             
         result = target_values[0] if batch_size == 1 else target_values
@@ -1180,8 +1187,8 @@ class NFConditionalPrior(Prior):
             cond = torch.tensor(m2.reshape(-1, 1), dtype=torch.float32)
             lambdas = self.nf.sample(batch_size, conditional=cond).cpu().numpy()
             
-            # For NSBH, convert from log space and enforce bounds
-            if hasattr(self, 'take_log_lambda') and self.take_log_lambda:
+            # Convert from log space and enforce bounds
+            if self.take_log_lambda:
                 target_values = np.exp(lambdas.flatten())
             else:
                 target_values = lambdas.flatten()
@@ -1233,6 +1240,10 @@ class NFConditionalPrior(Prior):
             # Use NF inverse transform
             lambdas, _ = self.nf.inverse(normal_tensor, conditional=cond)
             lambdas = lambdas.cpu().numpy()
+            
+            # Convert from log space if needed and enforce bounds
+            if self.take_log_lambda:
+                lambdas = np.exp(lambdas)
             
             # Extract target parameter and enforce bounds
             target_values = lambdas[:, self.target_index]
@@ -1290,11 +1301,10 @@ class NFConditionalPrior(Prior):
         
         val = np.atleast_1d(val)
         
-        # FIXME: doing this in constraints
-        # # Check bounds first
-        # out_of_bounds = (val < self.minimum) | (val > self.maximum)
-        # if np.any(out_of_bounds):
-        #     return np.full_like(val, -np.inf, dtype=float)
+        # Check bounds first
+        out_of_bounds = (val < self.minimum) | (val > self.maximum)
+        if np.any(out_of_bounds):
+            return np.full_like(val, -np.inf, dtype=float)
             
         # TODO: check if this is necessary or if fails?
         # # Check for required variables
@@ -1335,12 +1345,11 @@ class NFConditionalPrior(Prior):
     def _ln_prob_nsbh(self, val, **required_variables):
         """Compute log probability using the NSBH NF"""
         
-        # FIXME: doing this in constraints
-        # # Check bounds first
-        # val = np.atleast_1d(val)
-        # out_of_bounds = (val < self.minimum) | (val > self.maximum)
-        # if np.any(out_of_bounds):
-        #     return np.full_like(val, -np.inf, dtype=float)
+        # Check bounds first
+        val = np.atleast_1d(val)
+        out_of_bounds = (val < self.minimum) | (val > self.maximum)
+        if np.any(out_of_bounds):
+            return np.full_like(val, -np.inf, dtype=float)
             
         # TODO: check if this is necessary or if fails?
         # # Check for required variables
