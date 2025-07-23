@@ -1057,7 +1057,7 @@ class NFConditionalPrior(Prior):
                 n_conditional_inputs=config["n_conditional_inputs"],
                 n_transforms=kwargs["n_transforms"],
                 n_neurons=kwargs["n_neurons"],
-                n_blocks_per_transform=kwargs["n_blocks_per_transform"],
+                # n_blocks_per_transform=kwargs["n_blocks_per_transform"], # FIXME: this is accidentally not used in training
                 batch_norm_between_transforms=True
             )
         elif self.source_type == "nsbh":
@@ -1066,7 +1066,7 @@ class NFConditionalPrior(Prior):
                 n_conditional_inputs=config["n_conditional_inputs"],
                 n_transforms=kwargs["n_transforms"],
                 n_neurons=kwargs["n_neurons"],
-                n_blocks_per_transform=kwargs["n_blocks_per_transform"]
+                # n_blocks_per_transform=kwargs["n_blocks_per_transform"] # FIXME: this is accidentally not used in training
             )
         self.nf.load_state_dict(torch.load(nf_model_path, map_location="cpu"))
         self.nf.eval()
@@ -1398,9 +1398,17 @@ class NFConditionalPrior(Prior):
             if self.target_index == 0:
                 # val is lambda_1, other_lambda is lambda_2
                 lambda_pairs = np.column_stack([val, other_lambda])
+                
+                # lambda_2 must be bigger than lambda_1
+                violates_lambda_order = val > other_lambda
             else:
                 # val is lambda_2, other_lambda is lambda_1
                 lambda_pairs = np.column_stack([other_lambda, val])
+                
+                # lambda_2 must be bigger than lambda_1
+                violates_lambda_order = other_lambda > val
+                
+            penalty_lambda_order = np.where(violates_lambda_order, -np.inf, 0.0)
                 
             # Apply log transformation if needed
             if self.take_log_lambda:
@@ -1417,6 +1425,9 @@ class NFConditionalPrior(Prior):
                 # d(log(lambda))/d(lambda) = 1/lambda for each lambda
                 jacobian_correction = -np.log(np.maximum(val, 1e-10)) - np.log(np.maximum(other_lambda, 1e-10))
                 joint_logp += jacobian_correction
+            
+            # Add penalty for lambda_2 < lambda_1
+            joint_logp += penalty_lambda_order
             
         return float(joint_logp[0]) if is_scalar_input else joint_logp
         
