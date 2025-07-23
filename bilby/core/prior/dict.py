@@ -18,6 +18,7 @@ from ..utils import (
 
 # TODO: This is for the NF priors -- might have to replace this in a separate file, for now, keep it here
 import torch
+import joblib
 from scipy.stats import norm
 from glasflow.flows import RealNVP
 from glasflow.flows.autoregressive import MaskedAffineAutoregressiveFlow
@@ -1071,6 +1072,16 @@ class NFConditionalPrior(Prior):
         self.nf.load_state_dict(torch.load(nf_model_path, map_location="cpu"))
         self.nf.eval()
         
+        # Load the scaler if it exists
+        model_dir = os.path.dirname(nf_model_path)
+        scaler_path = os.path.join(model_dir, "scaler.gz")
+        self.scaler = None
+        if os.path.exists(scaler_path):
+            logger.info(f"Loading scaler from {scaler_path}")
+            self.scaler = joblib.load(scaler_path)
+        else:
+            logger.info("No scaler found - assuming input was not scaled during training")
+        
         # Store configuration
         self.nf_model_path = nf_model_path
         self.target_param = target_param
@@ -1172,7 +1183,12 @@ class NFConditionalPrior(Prior):
             cond = torch.tensor(np.column_stack([m1, m2]), dtype=torch.float32)
             lambdas = self.nf.sample(batch_size, conditional=cond).cpu().numpy()
             
-            # Convert from log space
+            # Apply inverse scaling if scaler was used during training
+            if self.scaler is not None:
+                logger.debug("Applying inverse scaling to NF samples")
+                lambdas = self.scaler.inverse_transform(lambdas)
+            
+            # Convert from scaled space
             if self.take_log_lambda:
                 lambdas = np.exp(lambdas)
             
@@ -1227,7 +1243,12 @@ class NFConditionalPrior(Prior):
             cond = torch.tensor(m2.reshape(-1, 1), dtype=torch.float32)
             lambdas = self.nf.sample(batch_size, conditional=cond).cpu().numpy()
             
-            # Convert from log space and enforce bounds
+            # Apply inverse scaling if scaler was used during training
+            if self.scaler is not None:
+                logger.debug("Applying inverse scaling to NF samples")
+                lambdas = self.scaler.inverse_transform(lambdas)
+            
+            # Convert from scaled space and enforce bounds
             if self.take_log_lambda:
                 target_values = np.exp(lambdas.flatten())
             else:
@@ -1281,7 +1302,12 @@ class NFConditionalPrior(Prior):
             lambdas, _ = self.nf.inverse(normal_tensor, conditional=cond)
             lambdas = lambdas.cpu().numpy()
             
-            # Convert from log space if needed and enforce bounds
+            # Apply inverse scaling if scaler was used during training
+            if self.scaler is not None:
+                logger.debug("Applying inverse scaling to NF rescale outputs")
+                lambdas = self.scaler.inverse_transform(lambdas)
+            
+            # Convert from scaled space if needed and enforce bounds
             if self.take_log_lambda:
                 lambdas = np.exp(lambdas)
             
@@ -1322,9 +1348,16 @@ class NFConditionalPrior(Prior):
             
             # Use NF inverse transform
             lambdas, _ = self.nf.inverse(normal_tensor, conditional=cond)
-            lambdas = lambdas.cpu().numpy().flatten()
+            lambdas = lambdas.cpu().numpy()
             
-            # Convert from log space if needed and enforce bounds
+            # Apply inverse scaling if scaler was used during training
+            if self.scaler is not None:
+                logger.debug("Applying inverse scaling to NF rescale outputs")
+                lambdas = self.scaler.inverse_transform(lambdas)
+            
+            lambdas = lambdas.flatten()
+            
+            # Convert from scaled space if needed and enforce bounds
             if self.take_log_lambda:
                 target_values = np.exp(lambdas)
             else:
@@ -1413,6 +1446,11 @@ class NFConditionalPrior(Prior):
             # Apply log transformation if needed
             if self.take_log_lambda:
                 lambda_pairs = np.log(np.maximum(lambda_pairs, 1e-10))
+            
+            # Apply scaling if scaler was used during training
+            if self.scaler is not None:
+                logger.debug("Applying scaling to lambda pairs for ln_prob computation")
+                lambda_pairs = self.scaler.transform(lambda_pairs)
                 
             x = torch.tensor(lambda_pairs, dtype=torch.float32)
             cond = torch.tensor(np.column_stack([m1, m2]), dtype=torch.float32)
@@ -1468,6 +1506,11 @@ class NFConditionalPrior(Prior):
                 x_input = np.log(np.maximum(val, 1e-10))  # Avoid log(0)
             else:
                 x_input = val
+            
+            # Apply scaling if scaler was used during training
+            if self.scaler is not None:
+                logger.debug("Applying scaling to lambda values for ln_prob computation")
+                x_input = self.scaler.transform(x_input.reshape(-1, 1)).flatten()
                 
             x = torch.tensor(x_input.reshape(-1, 1), dtype=torch.float32)
             cond = torch.tensor(np.atleast_1d(m2).reshape(-1, 1), dtype=torch.float32)
