@@ -591,19 +591,13 @@ class Sampler(object):
         parameters = []
         likelihood = []
         while len(unit_cube) < npoints:
-            print(f"{len(unit_cube)}/{npoints}")
             unit = rng.uniform(0, 1, self.ndim)
             theta = self.prior_transform(unit)
             if self.check_draw(theta, warning=False):
-                print(f"Draw accepted: len(unit_cube) = {len(unit_cube)} / npoints = {npoints}")
                 unit_cube.append(unit)
                 parameters.append(theta)
                 likelihood.append(self.log_likelihood(theta))
 
-        logger.info("Generating initial points from the prior DONE!")
-        logger.info("Parameters shown now")
-        logger.info(np.array(parameters))
-        
         return np.array(unit_cube), np.array(parameters), np.array(likelihood)
 
     def check_draw(self, theta, warning=True):
@@ -628,7 +622,6 @@ class Sampler(object):
         log_p = self.log_prior(theta)
         log_l = self.log_likelihood(theta)
         
-        print("Checking bad values")
         return self._check_bad_value(
             val=log_p, warning=warning, theta=theta, label="prior"
         ) and self._check_bad_value(
