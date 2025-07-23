@@ -1205,10 +1205,10 @@ class NFConditionalPrior(Prior):
             
             # Extract the target lambda using the target index
             target_values = lambdas[:, self.target_index]
+            target_values = np.maximum(0.0, target_values)
             
             # FIXME: not done here for prob reasons, using the constraint priors for that
             # # Enforce bounds
-            # target_values = np.maximum(0.0, target_values)
             # target_values = np.clip(target_values, self.minimum, self.maximum)
             
         result = target_values[0] if batch_size == 1 else target_values
@@ -1253,9 +1253,9 @@ class NFConditionalPrior(Prior):
                 target_values = np.exp(lambdas.flatten())
             else:
                 target_values = lambdas.flatten()
+            target_values = np.maximum(0.0, target_values)
                 
             # FIXME: doing this in constraints
-            # target_values = np.maximum(0.0, target_values)
             # target_values = np.clip(target_values, self.minimum, self.maximum)
             
         result = target_values[0] if batch_size == 1 else target_values
@@ -1313,9 +1313,9 @@ class NFConditionalPrior(Prior):
             
             # Extract target parameter and enforce bounds
             target_values = lambdas[:, self.target_index]
+            target_values = np.maximum(0.0, target_values)
             
             # FIXME: doing this with constraints
-            # target_values = np.maximum(0.0, target_values)
             # target_values = np.clip(target_values, self.minimum, self.maximum)
             
         return target_values[0] if len(target_values) == 1 else target_values
@@ -1362,9 +1362,9 @@ class NFConditionalPrior(Prior):
                 target_values = np.exp(lambdas)
             else:
                 target_values = lambdas
+            target_values = np.maximum(0.0, target_values)
                 
             # FIXME: doing this with constraints
-            # target_values = np.maximum(0.0, target_values)
             # target_values = np.clip(target_values, self.minimum, self.maximum)
             
         return target_values[0] if len(target_values) == 1 else target_values

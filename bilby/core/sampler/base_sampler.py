@@ -598,6 +598,7 @@ class Sampler(object):
                 parameters.append(theta)
                 likelihood.append(self.log_likelihood(theta))
 
+        logger.info("Generating initial points from the prior DONE")
         return np.array(unit_cube), np.array(parameters), np.array(likelihood)
 
     def check_draw(self, theta, warning=True):
