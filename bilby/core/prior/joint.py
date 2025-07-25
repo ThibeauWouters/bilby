@@ -981,6 +981,9 @@ class NFDist(BaseJointPriorDist):
         with open(kwargs_filename, "r") as f:
             kwargs = json.load(f)
         self.kwargs = kwargs
+        
+        self.source_type = kwargs["source_type"]
+        print(f"NFDist has source_type = {self.source_type}")
             
         # TODO: might generalize this?
         # Create NF model using updated parameter structure
@@ -1026,46 +1029,15 @@ class NFDist(BaseJointPriorDist):
         
         logger.info(f"Loaded NFDist prior with n_dim = {self.num_vars} from flow_filename = {self.flow_filename}")
         
-        # FIXME: not sure if this is needed or if I am wrong?
-        self.rescale_parameters = {}  # Add this line
-    
     def clean_samples(self, samp):
         """
         The NF might have some "leakage" into unphysical regions, so we need to clean the samples to ensure they are within the expected bounds. 
-        Note that for the component lambdas we separate the cleaning, since we might run NSBH and BHNS scenarios where only one lambda, either the primary or secondary, is sampled.
-        # TODO: this is currently for the default model used, but other NF models that we can train might need more cleaning methods than the ones presented here.
+        All the parameters have to be positive, so we clip them to be safely >= 0.0.
         """
 
-        ### Component lambdas
-
-        # If we sample the primary Lambda, clip to positive values, and save again
-        if "lambda_1" in self.names:
-            lambda_1_idx = self.names.index("lambda_1")
-            lambda_1 = np.clip(samp[:, lambda_1_idx], 0.0, None)
-            samp[:, lambda_1_idx] = lambda_1
-            
-        # If we sample the secondary Lambda, clip to positive values, and save again
-        if "lambda_2" in self.names:
-            lambda_2_idx = self.names.index("lambda_2")
-            lambda_2 = np.clip(samp[:, lambda_2_idx], 0.0, None)
-            samp[:, lambda_2_idx] = lambda_2
-        
-        # If we sample component lambdas in a BNS setting, clean those
-        if "lambda_1" in self.names and "lambda_2" in self.names:
-            # Ensure lambda_1 < lambda_2
-            samp[:, lambda_1_idx] = np.minimum(lambda_1, lambda_2) 
-            samp[:, lambda_2_idx] = np.maximum(lambda_1, lambda_2)
-            
-        ### Clip lambda tildes to positive values
-        if "lambda_tilde" in self.names:
-            lambda_tilde_idx = self.names.index("lambda_tilde")
-            lambda_tilde = np.clip(samp[:, lambda_tilde_idx], 0.0, None)
-            samp[:, lambda_tilde_idx] = lambda_tilde
-            
-        if "delta_lambda_tilde" in self.names:
-            delta_lambda_tilde_idx = self.names.index("delta_lambda_tilde")
-            delta_lambda_tilde = np.clip(samp[:, delta_lambda_tilde_idx], 0.0, None)
-            samp[:, delta_lambda_tilde_idx] = delta_lambda_tilde
+        # Clip all the samples to be positive
+        for i in range(self.num_vars):
+            samp[:, i] = np.clip(samp[:, i], 0.1, None)
             
         return samp
         
@@ -1184,7 +1156,7 @@ class NFPrior(JointPrior):
         float:
             the logp value for the prior at given sample
         """
-        # val = float(val) # TODO: remove if OK?
+        val = float(val) # TODO: remove if OK?
         self.dist.requested_parameters[self.name] = val
 
         if self.dist.filled_request():
@@ -1218,7 +1190,7 @@ class NFPrior(JointPrior):
             return lnp
         else:
             # if not all parameters have been requested yet, just return 0
-            if isinstance(val, (float, int)):
+            if isinstance(val, (float, int, np.int32)):
                 # return np.array([0.0]) # this is for nessai
                 return 0.0
             else:

@@ -593,6 +593,8 @@ class Sampler(object):
         while len(unit_cube) < npoints:
             unit = rng.uniform(0, 1, self.ndim)
             theta = self.prior_transform(unit)
+            print("theta")
+            print(theta)
             if self.check_draw(theta, warning=False):
                 unit_cube.append(unit)
                 parameters.append(theta)
