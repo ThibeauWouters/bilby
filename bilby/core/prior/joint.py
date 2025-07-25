@@ -67,6 +67,36 @@ class BaseJointPriorDist(object):
         self._uncorrelated = None
         self._current_lnprob = None
 
+        # a dictionary of the parameters as requested by the prior
+        self.requested_parameters = dict()
+        self.reset_request()
+
+        # a dictionary of the rescaled parameters
+        self.rescale_parameters = dict()
+        self.reset_rescale()
+
+        # a list of sampled parameters
+        self.reset_sampled()
+
+    def reset_sampled(self):
+        self.sampled_parameters = []
+        self.current_sample = {}
+
+    def filled_request(self):
+        """
+        Check if all requested parameters have been filled.
+        """
+
+        return not np.any([val is None for val in self.requested_parameters.values()])
+
+    def reset_request(self):
+        """
+        Reset the requested parameters to None.
+        """
+
+        for name in self.names:
+            self.requested_parameters[name] = None
+
     def filled_rescale(self):
         """
         Check if all the rescaled parameters have been filled.
@@ -325,7 +355,6 @@ class BaseJointPriorDist(object):
         if self.__class__ != other.__class__:
             return False
         return self.get_instantiation_dict() == other.get_instantiation_dict()
-
 
 class MultivariateGaussianDist(BaseJointPriorDist):
     def __init__(
@@ -924,10 +953,25 @@ class NFDist(BaseJointPriorDist):
     
     def __init__(self, 
                  names,
-                 flow_filename: str):
+                 flow_filename: str,
+                 include_dL: bool = True,
+                 use_tilde: bool = False,
+                 use_component_masses: bool = False,
+                 ):
         
-        super(NFDist, self).__init__(names=names)
+        # Create the bounds here for simplicity since we kind of hard code this prior
+        bounds = {k: None for k in names}
+        if "lambda_1" in names:
+            bounds["lambda_1"] = (0.0, 100_000)
+        if "lambda_2" in names:
+            bounds["lambda_2"] = (0.0, 100_000)
+        
+        super(NFDist, self).__init__(names=names, bounds=bounds)
+
         self.flow_filename = flow_filename
+        self.include_dL = include_dL
+        self.use_tilde = use_tilde
+        self.use_component_masses = use_component_masses
         
         # Check if the filename exists:
         if not os.path.isfile(flow_filename):
@@ -936,22 +980,32 @@ class NFDist(BaseJointPriorDist):
         kwargs_filename = flow_filename.replace(".pt", "_kwargs.json")
         with open(kwargs_filename, "r") as f:
             kwargs = json.load(f)
+        self.kwargs = kwargs
             
-        flow = CouplingNSF(n_inputs=self.num_vars,
-                           n_transforms=kwargs["n_transforms"],
-                           n_neurons=kwargs["n_neurons"],
-                           n_blocks_per_transform=kwargs["n_blocks_per_transform"]
+        # TODO: might generalize this?
+        # Create NF model using updated parameter structure
+        flow = CouplingNSF(
+            n_inputs=self.kwargs["n_inputs"],
+            n_transforms=self.kwargs["n_transforms"],
+            n_neurons=self.kwargs["n_neurons"],
+            n_blocks_per_transform=self.kwargs["n_blocks_per_transform"],
         )
         
-        # Load the scaler:
-        scaler_name = flow_filename.replace(".pt", "_scaler.gz")
-        self.scaler: MinMaxScaler = joblib.load(scaler_name)
-
-        # Load model weights
-        flow.load_state_dict(torch.load(flow_filename))
+        # Load model weights with CPU mapping for compatibility
+        flow.load_state_dict(torch.load(flow_filename, map_location="cpu"))
         self.nf = flow
         self.nf.eval()
-        self.nf.compile()
+        
+        # Load the scaler - check model directory first for modern layout
+        model_dir = os.path.dirname(flow_filename)
+        scaler_path = os.path.join(model_dir, "scaler.gz")
+        if os.path.exists(scaler_path):
+            logger.info(f"Loading scaler from {scaler_path}")
+            self.scaler: MinMaxScaler = joblib.load(scaler_path)
+        else:
+            logger.info("No scaler found - assuming input was not scaled during training")
+            self.scaler = None
+
         # Test sample
         with torch.inference_mode():
             self.nf.sample(100)
@@ -972,66 +1026,112 @@ class NFDist(BaseJointPriorDist):
         
         logger.info(f"Loaded NFDist prior with n_dim = {self.num_vars} from flow_filename = {self.flow_filename}")
         
+        # FIXME: not sure if this is needed or if I am wrong?
+        self.rescale_parameters = {}  # Add this line
+    
     def clean_samples(self, samp):
         """
-        Sometimes the NF seemingly returns something slightly unphysical. Need to clip it or change some
+        The NF might have some "leakage" into unphysical regions, so we need to clean the samples to ensure they are within the expected bounds. 
+        Note that for the component lambdas we separate the cleaning, since we might run NSBH and BHNS scenarios where only one lambda, either the primary or secondary, is sampled.
+        # TODO: this is currently for the default model used, but other NF models that we can train might need more cleaning methods than the ones presented here.
         """
-        
-        # First, fix the masses: make sure m1 > m2:
-        m1_samp = samp[:, 0]
-        m2_samp = samp[:, 1]
-        
-        # Make sure the masses are not too crazy out of the usual training bounds
-        m1_samp = np.clip(m1_samp, 0.5, 10.0)
-        m2_samp = np.clip(m2_samp, 0.5, 10.0)
-        
-        m1 = np.maximum(m1_samp, m2_samp)
-        m2 = np.minimum(m1_samp, m2_samp)
-        
-        # Make sure lambdas are OK, after which we rebuild samp per dimensional case
-        if self.num_vars == 3:
-            lambda_2_samp = samp[:, 2]
-            lambda_2 = np.clip(lambda_2_samp, 0.0, None)
-            samp = np.column_stack((m1, m2, lambda_2))
-        
-        else:
-            lambda_1_samp = samp[:, 2]
-            lambda_2_samp = samp[:, 3]
+
+        ### Component lambdas
+
+        # If we sample the primary Lambda, clip to positive values, and save again
+        if "lambda_1" in self.names:
+            lambda_1_idx = self.names.index("lambda_1")
+            lambda_1 = np.clip(samp[:, lambda_1_idx], 0.0, None)
+            samp[:, lambda_1_idx] = lambda_1
             
-            lambda_1_samp = np.clip(lambda_1_samp, 0.0, None)
-            lambda_2_samp = np.clip(lambda_2_samp, 0.0, None)
+        # If we sample the secondary Lambda, clip to positive values, and save again
+        if "lambda_2" in self.names:
+            lambda_2_idx = self.names.index("lambda_2")
+            lambda_2 = np.clip(samp[:, lambda_2_idx], 0.0, None)
+            samp[:, lambda_2_idx] = lambda_2
+        
+        # If we sample component lambdas in a BNS setting, clean those
+        if "lambda_1" in self.names and "lambda_2" in self.names:
+            # Ensure lambda_1 < lambda_2
+            samp[:, lambda_1_idx] = np.minimum(lambda_1, lambda_2) 
+            samp[:, lambda_2_idx] = np.maximum(lambda_1, lambda_2)
             
-            # Make sure lambda_2 > lambda_1 for the 4D case
-            lambda_1 = np.minimum(lambda_1_samp, lambda_2_samp)
-            lambda_2 = np.maximum(lambda_1_samp, lambda_2_samp)
+        ### Clip lambda tildes to positive values
+        if "lambda_tilde" in self.names:
+            lambda_tilde_idx = self.names.index("lambda_tilde")
+            lambda_tilde = np.clip(samp[:, lambda_tilde_idx], 0.0, None)
+            samp[:, lambda_tilde_idx] = lambda_tilde
             
-            samp = np.column_stack((m1, m2, lambda_1, lambda_2))
+        if "delta_lambda_tilde" in self.names:
+            delta_lambda_tilde_idx = self.names.index("delta_lambda_tilde")
+            delta_lambda_tilde = np.clip(samp[:, delta_lambda_tilde_idx], 0.0, None)
+            samp[:, delta_lambda_tilde_idx] = delta_lambda_tilde
             
         return samp
         
     def _ln_prob(self, samp, lnprob, outbounds):
+        
+        # TODO: we do outbounds manually here, that is not the best method (but it works for now), change later
+        
+        # Check for lambda_1 > lambda_2, which is unphysical, and return -inf for those samples
+        unphysical_lambda = np.zeros(samp.shape[0], dtype=bool)
+        if "lambda_1" in self.names and "lambda_2" in self.names:
+            lambda_1_idx = self.names.index("lambda_1")
+            lambda_2_idx = self.names.index("lambda_2")
+            lambda_1 = samp[:, lambda_1_idx]
+            lambda_2 = samp[:, lambda_2_idx]
+            unphysical_lambda = lambda_1 > lambda_2 # unphysical if lambda_1 > lambda_2
+        
+        # Check for lambda_1 < 0 or lambda_2 < 0, which is unphysical, and return -inf for those samples
+        if "lambda_1" in self.names:
+            lambda_1_idx = self.names.index("lambda_1")
+            lambda_1 = samp[:, lambda_1_idx]
+            unphysical_lambda |= lambda_1 < 0.0
+        
+        if "lambda_2" in self.names:
+            lambda_2_idx = self.names.index("lambda_2")
+            lambda_2 = samp[:, lambda_2_idx]
+            unphysical_lambda |= lambda_2 < 0.0
+        
+        # Check for lambda_tilde < 0 or delta_lambda_tilde < 0, which is unphysical, and return -inf for those samples
+        if "lambda_tilde" in self.names:
+            lambda_tilde_idx = self.names.index("lambda_tilde")
+            lambda_tilde = samp[:, lambda_tilde_idx]
+            unphysical_lambda |= lambda_tilde < 0.0
+            
+        if "delta_lambda_tilde" in self.names:
+            delta_lambda_tilde_idx = self.names.index("delta_lambda_tilde")
+            delta_lambda_tilde = samp[:, delta_lambda_tilde_idx]
+            unphysical_lambda |= delta_lambda_tilde < 0.0
+        
         with torch.inference_mode():
             # Ensure the shape is correct
             if len(samp.shape) == 1:
                 samp = samp.reshape(1, self.num_vars)
                 
             # Use the scaler to transform to the preprocessed space for the NF
-            samp = self.scaler.transform(samp)
+            if self.scaler is not None:
+                samp = self.scaler.transform(samp)
                 
             # Get the log-probability of the sample, passing to Torch tensor first
             samp = torch.tensor(samp, dtype=torch.float32)
             log_probs = self.nf.log_prob(samp)
-            log_probs = np.atleast_2d(log_probs.cpu().numpy())
-        
-        return log_probs
+            log_probs = log_probs.cpu().numpy()
+            
+        # Set in-bounds values to log_probs, out-of-bounds and unphysical to -inf
+        valid_samples = ~outbounds & ~unphysical_lambda
+        lnprob[valid_samples] = log_probs[valid_samples]
+        lnprob[~valid_samples] = -np.inf
+        return lnprob
     
     def _sample(self, size, **kwargs):
         with torch.inference_mode():
-            flow_samp = self.nf.sample(size)
+            flow_samp = self.nf.sample(int(size))
             flow_samp = flow_samp.cpu().numpy()
             
             # Rescale the samples with sklearn's MinMaxScaler
-            flow_samp = self.scaler.inverse_transform(flow_samp)
+            if self.scaler is not None:
+                flow_samp = self.scaler.inverse_transform(flow_samp)
             
             # Clean the samples -- return as float64 to not break dynesty
             flow_samp = self.clean_samples(flow_samp) # .astype(np.float32)
@@ -1058,7 +1158,8 @@ class NFDist(BaseJointPriorDist):
             flow_samp = flow_samp.cpu().numpy()
             
             # Rescale the samples with sklearn's MinMaxScaler
-            flow_samp = self.scaler.inverse_transform(flow_samp)
+            if self.scaler is not None:
+                flow_samp = self.scaler.inverse_transform(flow_samp)
         
             # Clean the samples -- return as float64 to not break dynesty
             flow_samp = self.clean_samples(flow_samp) # .astype(np.float32)
@@ -1066,7 +1167,7 @@ class NFDist(BaseJointPriorDist):
         return flow_samp
 
 class NFPrior(JointPrior):
-    """This is taken from Ann-Kristin Malz's code, glitchflow, available at https://zenodo.org/records/15316399"""
+    """This is partly inspired by Ann-Kristin Malz's code, glitchflow, available at https://zenodo.org/records/15316399"""
     
     def ln_prob(self, val):
         """
@@ -1130,5 +1231,3 @@ class NFPrior(JointPrior):
 
                 ret = np.zeros_like(val)
                 return ret
-
-
