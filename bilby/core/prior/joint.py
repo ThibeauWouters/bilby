@@ -954,11 +954,11 @@ class NFDist(BaseJointPriorDist):
     def __init__(self, 
                  names,
                  flow_filename: str,
-                 include_dL: bool = True,
                  use_tilde: bool = False,
                  use_component_masses: bool = False,
                  ):
         
+        # FIXME: I think the bounds are not working properly
         # Create the bounds here for simplicity since we kind of hard code this prior
         bounds = {k: None for k in names}
         if "lambda_1" in names:
@@ -969,7 +969,6 @@ class NFDist(BaseJointPriorDist):
         super(NFDist, self).__init__(names=names, bounds=bounds)
 
         self.flow_filename = flow_filename
-        self.include_dL = include_dL
         self.use_tilde = use_tilde
         self.use_component_masses = use_component_masses
         
@@ -992,6 +991,7 @@ class NFDist(BaseJointPriorDist):
             n_transforms=self.kwargs["n_transforms"],
             n_neurons=self.kwargs["n_neurons"],
             n_blocks_per_transform=self.kwargs["n_blocks_per_transform"],
+            num_bins=self.kwargs["num_bins"]
         )
         
         # Load model weights with CPU mapping for compatibility
@@ -1035,6 +1035,7 @@ class NFDist(BaseJointPriorDist):
         All the parameters have to be positive, so we clip them to be safely >= 0.0.
         """
 
+        # FIXME: make this more flexible in terms of different parameters needing different bounds?
         # Clip all the samples to be positive
         for i in range(self.num_vars):
             samp[:, i] = np.clip(samp[:, i], 0.1, None)
