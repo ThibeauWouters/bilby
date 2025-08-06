@@ -1156,7 +1156,11 @@ class NFPrior(JointPrior):
         float:
             the logp value for the prior at given sample
         """
-        val = float(val) # TODO: remove if OK?
+        try:
+            val = float(val) # TODO: remove if OK?
+        except Exception as e:
+            print(f"At this point, we cannot create a float from {val}, error: {e}")
+            
         self.dist.requested_parameters[self.name] = val
 
         if self.dist.filled_request():
