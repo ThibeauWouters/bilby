@@ -17,6 +17,17 @@ import torch
 from sklearn.preprocessing import MinMaxScaler
 import joblib
 
+### flowjax
+import jax
+import jax.numpy as jnp
+import jax.random as jr
+from flowjax.flows import masked_autoregressive_flow, coupling_flow
+from flowjax.distributions import Normal
+import equinox as eqx
+
+# # Enable jax float 64 for accuracy
+# jax.config.update("jax_enable_x64", True)
+
 class BaseJointPriorDist(object):
     def __init__(self, names, bounds=None):
         """
@@ -976,30 +987,20 @@ class NFDist(BaseJointPriorDist):
         if not os.path.isfile(flow_filename):
             raise FileNotFoundError(f"File {flow_filename} does not exist.")
         
-        kwargs_filename = flow_filename.replace(".pt", "_kwargs.json")
+        # Load kwargs and determine backend
+        kwargs_filename = flow_filename.replace(".pt", "_kwargs.json").replace(".eqx", "_kwargs.json")
         with open(kwargs_filename, "r") as f:
             kwargs = json.load(f)
         self.kwargs = kwargs
         
         self.source_type = kwargs["source_type"]
         print(f"NFDist has source_type = {self.source_type}")
-            
-        # TODO: might generalize this?
-        # Create NF model using updated parameter structure
-        flow = CouplingNSF(
-            n_inputs=self.kwargs["n_inputs"],
-            n_transforms=self.kwargs["n_transforms"],
-            n_neurons=self.kwargs["n_neurons"],
-            n_blocks_per_transform=self.kwargs["n_blocks_per_transform"],
-            num_bins=self.kwargs["num_bins"]
-        )
         
-        # Load model weights with CPU mapping for compatibility
-        flow.load_state_dict(torch.load(flow_filename, map_location="cpu"))
-        self.nf = flow
-        self.nf.eval()
+        # Determine which backend to use (flowjax vs glasflow)
+        self.use_flowjax = kwargs.get("use_flowjax", "False") == "True"
+        logger.info(f"Using {'flowJAX' if self.use_flowjax else 'glasflow'} backend")
         
-        # Load the scaler - check model directory first for modern layout
+        # Load the scaler
         model_dir = os.path.dirname(flow_filename)
         scaler_path = os.path.join(model_dir, "scaler.gz")
         if os.path.exists(scaler_path):
@@ -1009,9 +1010,13 @@ class NFDist(BaseJointPriorDist):
             logger.info("No scaler found - assuming input was not scaled during training")
             self.scaler = None
 
-        # Test sample
-        with torch.inference_mode():
-            self.nf.sample(100)
+        # Load the model and set up functions based on backend
+        if self.use_flowjax:
+            self._setup_flowjax_model()
+            self._setup_flowjax_functions()
+        else:
+            self._setup_glasflow_model() 
+            self._setup_glasflow_functions()
         
         # Define the n-dimensional standard normal distribution for easier rescaling later on
         names = [f"x{i}" for i in range(1, self.num_vars + 1)]
@@ -1028,6 +1033,122 @@ class NFDist(BaseJointPriorDist):
         )
         
         logger.info(f"Loaded NFDist prior with n_dim = {self.num_vars} from flow_filename = {self.flow_filename}")
+        
+    def _setup_glasflow_model(self):
+        """Set up glasflow model."""
+        flow = CouplingNSF(
+            n_inputs=self.kwargs["n_inputs"],
+            n_transforms=self.kwargs["n_transforms"],
+            n_neurons=self.kwargs["n_neurons"],
+            n_blocks_per_transform=self.kwargs["n_blocks_per_transform"],
+            num_bins=self.kwargs["num_bins"]
+        )
+        
+        # Load model weights with CPU mapping for compatibility
+        flow.load_state_dict(torch.load(self.flow_filename, map_location="cpu"))
+        self.nf = flow
+        self.nf.eval()
+        
+        # Test sample
+        with torch.inference_mode():
+            self.nf.sample(100)
+            
+    def _setup_flowjax_model(self):
+        """Set up flowjax model."""
+        # Create base distribution
+        base_dist = Normal(jnp.zeros(self.kwargs["n_inputs"]))
+        key = jr.key(42)
+        
+        # Choose flow type based on model type in kwargs
+        model_type = self.kwargs.get("model_type", "coupling_flow")
+        
+        if model_type == "coupling_flow":
+            flow = coupling_flow(
+                key=key,
+                base_dist=base_dist,
+                flow_layers=self.kwargs["n_transforms"],
+                nn_width=self.kwargs["n_neurons"],
+                nn_depth=self.kwargs["nn_depth"]
+            )
+        elif model_type == "masked_autoregressive_flow":
+            flow = masked_autoregressive_flow(
+                key=key,
+                base_dist=base_dist,
+                flow_layers=self.kwargs["n_transforms"],
+                nn_width=self.kwargs["n_neurons"],
+                nn_depth=self.kwargs["nn_depth"]
+            )
+        else:
+            raise ValueError(f"Unsupported flowJAX model type: {model_type}")
+        
+        # Load the trained model
+        logger.info(f"Loading flowJAX model from {self.flow_filename}")
+        self.nf = eqx.tree_deserialise_leaves(self.flow_filename, flow)
+        
+        # Test sample
+        key = jr.key(123)
+        test_samples = self.nf.sample(key, (100,))
+        
+    def _setup_glasflow_functions(self):
+        """Set up glasflow-specific sampling and log prob functions."""
+        def nf_sample_glasflow(size):
+            with torch.inference_mode():
+                flow_samp = self.nf.sample(int(size))
+                return flow_samp.cpu().numpy()
+                
+        def nf_ln_prob_glasflow(samp):
+            with torch.inference_mode():
+                samp_tensor = torch.tensor(samp, dtype=torch.float32)
+                log_probs = self.nf.log_prob(samp_tensor)
+                return log_probs.cpu().numpy()
+                
+        def nf_inverse_glasflow(samp):
+            with torch.inference_mode():
+                samp_tensor = torch.tensor(samp, dtype=torch.float32)
+                flow_samp, _ = self.nf.inverse(samp_tensor)
+                return flow_samp.cpu().numpy()
+                
+        self.nf_sample = nf_sample_glasflow
+        self.nf_ln_prob = nf_ln_prob_glasflow
+        self.nf_inverse = nf_inverse_glasflow
+        
+    def _setup_flowjax_functions(self):
+        """Set up flowjax-specific sampling and log prob functions."""
+        def nf_sample_flowjax(size):
+            key = jr.key(np.random.randint(0, 2**31))
+            keys = jr.split(key, int(size))
+            
+            # TODO: figure out if passing size isn't better?``
+            @jax.jit
+            def sample_fn(sample_key):
+                return self.nf.sample(sample_key, (1,)).flatten()
+            
+            # Vectorize over keys
+            samples_jax = jax.vmap(sample_fn)(keys)
+            return np.array(samples_jax)
+        
+        # TODO: JIT or vmap?
+        def nf_ln_prob_flowjax(samp):
+            samp_jax = jnp.array(samp, dtype=jnp.float32)
+            log_probs = self.nf.log_prob(samp_jax)
+            return np.array(log_probs)
+            
+        # TODO: JIT or vmap?
+        def nf_inverse_flowjax(samp):
+            samp_jax = jnp.array(samp, dtype=jnp.float32)
+            # FlowJAX expects 1D input for single samples, 2D for batches
+            if len(samp_jax.shape) == 2 and samp_jax.shape[0] == 1:
+                samp_jax = samp_jax.flatten()
+                flow_samp = self.nf.bijection.inverse(samp_jax)
+                return np.array(flow_samp).reshape(1, -1)
+            else:
+                # Handle batch case
+                flow_samp = self.nf.bijection.inverse(samp_jax)
+                return np.array(flow_samp)
+            
+        self.nf_sample = nf_sample_flowjax
+        self.nf_ln_prob = nf_ln_prob_flowjax
+        self.nf_inverse = nf_inverse_flowjax
         
     def clean_samples(self, samp):
         """
@@ -1077,19 +1198,16 @@ class NFDist(BaseJointPriorDist):
             delta_lambda_tilde = samp[:, delta_lambda_tilde_idx]
             unphysical_lambda |= delta_lambda_tilde < 0.0
         
-        with torch.inference_mode():
-            # Ensure the shape is correct
-            if len(samp.shape) == 1:
-                samp = samp.reshape(1, self.num_vars)
-                
-            # Use the scaler to transform to the preprocessed space for the NF
-            if self.scaler is not None:
-                samp = self.scaler.transform(samp)
-                
-            # Get the log-probability of the sample, passing to Torch tensor first
-            samp = torch.tensor(samp, dtype=torch.float32)
-            log_probs = self.nf.log_prob(samp)
-            log_probs = log_probs.cpu().numpy()
+        # Ensure the shape is correct
+        if len(samp.shape) == 1:
+            samp = samp.reshape(1, self.num_vars)
+            
+        # Use the scaler to transform to the preprocessed space for the NF
+        if self.scaler is not None:
+            samp = self.scaler.transform(samp)
+            
+        # Get the log-probability using the modular function
+        log_probs = self.nf_ln_prob(samp)
             
         # Set in-bounds values to log_probs, out-of-bounds and unphysical to -inf
         valid_samples = ~outbounds & ~unphysical_lambda
@@ -1098,45 +1216,38 @@ class NFDist(BaseJointPriorDist):
         return lnprob
     
     def _sample(self, size, **kwargs):
-        with torch.inference_mode():
-            flow_samp = self.nf.sample(int(size))
-            flow_samp = flow_samp.cpu().numpy()
-            
-            # Rescale the samples with sklearn's MinMaxScaler
-            if self.scaler is not None:
-                flow_samp = self.scaler.inverse_transform(flow_samp)
-            
-            # Clean the samples -- return as float64 to not break dynesty
-            flow_samp = self.clean_samples(flow_samp) # .astype(np.float32)
-            
+        # Generate samples using the modular function
+        flow_samp = self.nf_sample(int(size))
+        
+        # Rescale the samples with sklearn's MinMaxScaler
+        if self.scaler is not None:
+            flow_samp = self.scaler.inverse_transform(flow_samp)
+        
+        # Clean the samples -- return as float64 to not break dynesty # TODO: does this comment still apply?
+        flow_samp = self.clean_samples(flow_samp)
+        
         return flow_samp
     
     def _rescale(self, samp, **kwargs):
-        with torch.inference_mode():
-            # Rescale them with MultivariateGaussianDist from unit hypercube to Gaussian (base dist)
-            mvg_samp = self.mvg.rescale(samp)
-            
-            # Ensure the shape is correct
-            mvg_samp = np.array(mvg_samp)
-            if len(mvg_samp.shape) == 1:
-                mvg_samp = mvg_samp.reshape(1, self.num_vars)
-            
-            # Then use the flow map to transform 
-            mvg_samp = torch.tensor(mvg_samp, dtype=torch.float32)
-
-            # Pass through the normalizing flow (note: inverse outputs something in data space!) -- this returns samples and log determinant Jacobian, but ignore the latter here
-            flow_samp, _ = self.nf.inverse(mvg_samp)
-
-            # Convert the result back to NumPy if needed
-            flow_samp = flow_samp.cpu().numpy()
-            
-            # Rescale the samples with sklearn's MinMaxScaler
-            if self.scaler is not None:
-                flow_samp = self.scaler.inverse_transform(flow_samp)
+        # Rescale them with MultivariateGaussianDist from unit hypercube to Gaussian (base dist)
+        mvg_samp = self.mvg.rescale(samp)
         
-            # Clean the samples -- return as float64 to not break dynesty
-            flow_samp = self.clean_samples(flow_samp) # .astype(np.float32)
+        # Ensure the shape is correct
+        mvg_samp = np.array(mvg_samp)
+        if len(mvg_samp.shape) == 1:
+            mvg_samp = mvg_samp.reshape(1, self.num_vars)
         
+        # Use the modular inverse function
+        flow_samp = self.nf_inverse(mvg_samp)
+        
+        # Rescale the samples with sklearn's MinMaxScaler
+        if self.scaler is not None:
+            flow_samp = self.scaler.inverse_transform(flow_samp)
+    
+        # FIXME: if the NF is trained better, this should no longer be necessary!
+        # Clean the samples -- return as float64 to not break dynesty # TODO: does this comment still apply?
+        flow_samp = self.clean_samples(flow_samp)
+    
         return flow_samp
 
 class NFPrior(JointPrior):
