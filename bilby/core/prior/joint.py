@@ -1009,9 +1009,21 @@ class NFDist(BaseJointPriorDist):
         if os.path.exists(scaler_path):
             logger.info(f"Loading scaler from {scaler_path}")
             self.scaler: MinMaxScaler = joblib.load(scaler_path)
+            
+            # Store parameter ranges for clipping
+            self.param_min = list(self.scaler.data_min_)
+            self.param_max = list(self.scaler.data_max_)
+            
+            logger.info("Parameter ranges from scaler:")
+            for i in range(len(self.names)):
+                param_name = self.names[i]
+                logger.info(f"  {param_name}: [{self.param_min[i]:.6f}, {self.param_max[i]:.6f}]")
         else:
             logger.info("No scaler found - assuming input was not scaled during training")
             self.scaler = None
+            # Create lists of None values for no clipping
+            self.param_min = [None] * len(self.names)
+            self.param_max = [None] * len(self.names)
 
         # Load the model and set up functions based on backend
         if self.use_flowjax:
@@ -1191,13 +1203,11 @@ class NFDist(BaseJointPriorDist):
     def clean_samples(self, samp):
         """
         The NF might have some "leakage" into unphysical regions, so we need to clean the samples to ensure they are within the expected bounds. 
-        All the parameters have to be positive, so we clip them to be safely >= 0.0.
+        Uses the scaler's parameter ranges if available, otherwise no clipping is applied.
         """
-
-        # FIXME: make this more flexible in terms of different parameters needing different bounds?
-        # Clip all the samples to be positive
+        
         for i in range(self.num_vars):
-            samp[:, i] = np.clip(samp[:, i], 0.1, None)
+            samp[:, i] = np.clip(samp[:, i], self.param_min[i], self.param_max[i])
             
         return samp
         
