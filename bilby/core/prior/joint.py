@@ -21,7 +21,7 @@ import joblib
 import jax
 import jax.numpy as jnp
 import jax.random as jr
-from flowjax.flows import masked_autoregressive_flow, coupling_flow
+from flowjax.flows import masked_autoregressive_flow, coupling_flow, block_neural_autoregressive_flow
 from flowjax.distributions import Normal
 import equinox as eqx
 
@@ -969,13 +969,16 @@ class NFDist(BaseJointPriorDist):
                  use_component_masses: bool = False,
                  ):
         
-        # FIXME: I think the bounds are not working properly
         # Create the bounds here for simplicity since we kind of hard code this prior
-        bounds = {k: None for k in names}
-        if "lambda_1" in names:
-            bounds["lambda_1"] = (0.0, 100_000)
-        if "lambda_2" in names:
-            bounds["lambda_2"] = (0.0, 100_000)
+        my_bounds = {
+            "lambda_1": (1e-2, 100_000),
+            "lambda_2": (1e-2, 100_000),
+            "chirp_mass": (1e-2, 5.0),
+            "chirp_mass_source": (1e-2, 5.0),
+            "mass_ratio": (0.125, 1.0),
+        }
+        bounds = [my_bounds[name] for name in names]
+        logger.info(f"Using bounds: {bounds} for names: {names}")
         
         super(NFDist, self).__init__(names=names, bounds=bounds)
 
@@ -1036,13 +1039,39 @@ class NFDist(BaseJointPriorDist):
         
     def _setup_glasflow_model(self):
         """Set up glasflow model."""
-        flow = CouplingNSF(
-            n_inputs=self.kwargs["n_inputs"],
-            n_transforms=self.kwargs["n_transforms"],
-            n_neurons=self.kwargs["n_neurons"],
-            n_blocks_per_transform=self.kwargs["n_blocks_per_transform"],
-            num_bins=self.kwargs["num_bins"]
-        )
+        
+        if self.kwargs["model_type"] == "CouplingNSF":
+            flow = CouplingNSF(
+                n_inputs=self.kwargs["n_inputs"],
+                n_transforms=self.kwargs["n_transforms"],
+                n_neurons=self.kwargs["n_neurons"],
+                n_blocks_per_transform=self.kwargs["n_blocks_per_transform"],
+                num_bins=self.kwargs["num_bins"]
+            )
+        elif self.kwargs["model_type"] == "MaskedAutoregressiveFlow":
+            raise NotImplementedError("MaskedAutoregressiveFlow is not implemented in bilby yet.")
+            
+            # # TODO: check this before uncommenting
+            # flow = MaskedAutoregressiveFlow(
+            #     n_inputs=self.kwargs["n_inputs"],
+            #     n_transforms=self.kwargs["n_transforms"],
+            #     n_neurons=self.kwargs["n_neurons"],
+            #     n_blocks_per_transform=self.kwargs["n_blocks_per_transform"]
+            # )
+            
+        elif self.kwargs["model_type"] == "Triangular":
+            raise NotImplementedError("MaskedAutoregressiveFlow is not implemented in bilby yet.")
+            
+            # # TODO: check this before uncommenting
+            # flow = MaskedAutoregressiveFlow(
+            #     n_inputs=self.kwargs["n_inputs"],
+            #     n_transforms=self.kwargs["n_transforms"],
+            #     n_neurons=self.kwargs["n_neurons"],
+            #     n_blocks_per_transform=self.kwargs["n_blocks_per_transform"]
+            # )
+            
+        else:
+            raise ValueError(f"Unsupported glasflow model type: {self.kwargs['model_type']}")
         
         # Load model weights with CPU mapping for compatibility
         flow.load_state_dict(torch.load(self.flow_filename, map_location="cpu"))
@@ -1060,7 +1089,8 @@ class NFDist(BaseJointPriorDist):
         key = jr.key(42)
         
         # Choose flow type based on model type in kwargs
-        model_type = self.kwargs.get("model_type", "coupling_flow")
+        model_type = self.kwargs.get("model_type", "block_neural_autoregressive_flow")
+        print(f"Using flowJAX model type: {model_type}")
         
         if model_type == "coupling_flow":
             flow = coupling_flow(
@@ -1077,6 +1107,14 @@ class NFDist(BaseJointPriorDist):
                 flow_layers=self.kwargs["n_transforms"],
                 nn_width=self.kwargs["n_neurons"],
                 nn_depth=self.kwargs["nn_depth"]
+            )
+        elif model_type == "block_neural_autoregressive_flow":
+            flow = block_neural_autoregressive_flow(
+                key=key,
+                base_dist=base_dist,
+                nn_depth=self.kwargs["nn_depth"],
+                nn_block_dim=self.kwargs["nn_block_dim"],
+                flow_layers=self.kwargs["flow_layers"],
             )
         else:
             raise ValueError(f"Unsupported flowJAX model type: {model_type}")
