@@ -997,7 +997,6 @@ class NFDist(BaseJointPriorDist):
         self.kwargs = kwargs
         
         self.source_type = kwargs["source_type"]
-        print(f"NFDist has source_type = {self.source_type}")
         
         # Determine which backend to use (flowjax vs glasflow)
         self.use_flowjax = kwargs.get("use_flowjax", "False") == "True"
