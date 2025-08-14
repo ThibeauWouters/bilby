@@ -1013,16 +1013,25 @@ class NFDist(BaseJointPriorDist):
             self.param_min = list(self.scaler.data_min_)
             self.param_max = list(self.scaler.data_max_)
             
+            # Compute log Jacobian correction for the MinMaxScaler transformation
+            # The Jacobian determinant is ∏_i (1/(x_max_i - x_min_i))
+            # So log|J| = ∑_i log(1/(x_max_i - x_min_i)) = -∑_i log(x_max_i - x_min_i)
+            param_ranges = [self.param_max[i] - self.param_min[i] for i in range(len(self.names))]
+            self.log_jacobian_correction = -np.sum(np.log(param_ranges))
+            
             logger.info("Parameter ranges from scaler:")
             for i in range(len(self.names)):
                 param_name = self.names[i]
                 logger.info(f"  {param_name}: [{self.param_min[i]:.6f}, {self.param_max[i]:.6f}]")
+            logger.info(f"Log Jacobian correction: {self.log_jacobian_correction:.6f}")
         else:
             logger.info("No scaler found - assuming input was not scaled during training")
             self.scaler = None
             # Create lists of None values for no clipping
             self.param_min = [None] * len(self.names)
             self.param_max = [None] * len(self.names)
+            # No Jacobian correction needed if no scaling
+            self.log_jacobian_correction = 0.0
 
         # Load the model and set up functions based on backend
         if self.use_flowjax:
@@ -1255,6 +1264,9 @@ class NFDist(BaseJointPriorDist):
             
         # Get the log-probability using the modular function
         log_probs = self.nf_ln_prob(samp)
+        
+        # Apply Jacobian correction for the rescaling transformation
+        log_probs = log_probs + self.log_jacobian_correction
             
         # Set in-bounds values to log_probs, out-of-bounds and unphysical to -inf
         valid_samples = ~outbounds & ~unphysical_lambda
