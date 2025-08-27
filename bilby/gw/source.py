@@ -677,8 +677,8 @@ def _base_lal_cbc_fd_waveform(
         h_plus[frequency_bounds] *= time_shift
         h_cross[frequency_bounds] *= time_shift
 
-    if len(waveform_kwargs) > 0:
-        logger.warning(UNUSED_KWARGS_MESSAGE.format(waveform_kwargs=waveform_kwargs))
+    # if len(waveform_kwargs) > 0:
+    #     logger.warning(UNUSED_KWARGS_MESSAGE.format(waveform_kwargs=waveform_kwargs))
 
     return dict(plus=h_plus, cross=h_cross)
 
@@ -1136,8 +1136,8 @@ def _base_waveform_frequency_sequence(
             else:
                 raise
 
-    if len(waveform_kwargs) > 0:
-        logger.warning(UNUSED_KWARGS_MESSAGE.format(waveform_kwargs=waveform_kwargs))
+    # if len(waveform_kwargs) > 0:
+    #     logger.warning(UNUSED_KWARGS_MESSAGE.format(waveform_kwargs=waveform_kwargs))
 
     return dict(plus=h_plus.data.data, cross=h_cross.data.data)
 
