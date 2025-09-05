@@ -17,17 +17,6 @@ import torch
 from sklearn.preprocessing import MinMaxScaler
 import joblib
 
-### flowjax
-import jax
-import jax.numpy as jnp
-import jax.random as jr
-from flowjax.flows import masked_autoregressive_flow, coupling_flow, block_neural_autoregressive_flow
-from flowjax.distributions import Normal
-import equinox as eqx
-
-# # Enable jax float 64 for accuracy
-# jax.config.update("jax_enable_x64", True)
-
 class BaseJointPriorDist(object):
     def __init__(self, names, bounds=None):
         """
@@ -971,11 +960,12 @@ class NFDist(BaseJointPriorDist):
         
         # Create the bounds here for simplicity since we kind of hard code this prior
         my_bounds = {
+            "chirp_mass_source": (1e-2, 5.0),
+            "mass_ratio": (0.05, 1.0),
             "lambda_1": (1e-2, 100_000),
             "lambda_2": (1e-2, 100_000),
             "chirp_mass": (1e-2, 5.0),
-            "chirp_mass_source": (1e-2, 5.0),
-            "mass_ratio": (0.125, 1.0),
+            "luminosity_distance": (1.0, 100_000.0), # FIXME: this might give unexpected behavior, we assume LVK and BNS, but we need to be more careful
         }
         bounds = [my_bounds[name] for name in names]
         logger.info(f"Using bounds: {bounds} for names: {names}")
@@ -990,17 +980,15 @@ class NFDist(BaseJointPriorDist):
         if not os.path.isfile(flow_filename):
             raise FileNotFoundError(f"File {flow_filename} does not exist.")
         
-        # Load kwargs and determine backend
-        kwargs_filename = flow_filename.replace(".pt", "_kwargs.json").replace(".eqx", "_kwargs.json")
+        # Load kwargs
+        kwargs_filename = flow_filename.replace(".pt", "_kwargs.json")
         with open(kwargs_filename, "r") as f:
             kwargs = json.load(f)
         self.kwargs = kwargs
         
         self.source_type = kwargs["source_type"]
         
-        # Determine which backend to use (flowjax vs glasflow)
-        self.use_flowjax = kwargs.get("use_flowjax", "False") == "True"
-        logger.info(f"Using {'flowJAX' if self.use_flowjax else 'glasflow'} backend")
+        logger.info("Using glasflow backend")
         
         # Load the scaler
         model_dir = os.path.dirname(flow_filename)
@@ -1033,13 +1021,8 @@ class NFDist(BaseJointPriorDist):
             # No Jacobian correction needed if no scaling
             self.log_jacobian_correction = 0.0
 
-        # Load the model and set up functions based on backend
-        if self.use_flowjax:
-            self._setup_flowjax_model()
-            self._setup_flowjax_functions()
-        else:
-            self._setup_glasflow_model() 
-            self._setup_glasflow_functions()
+        # Set up glasflow model
+        self._setup_glasflow_model()
         
         # Define the n-dimensional standard normal distribution for easier rescaling later on
         names = [f"x{i}" for i in range(1, self.num_vars + 1)]
@@ -1071,24 +1054,8 @@ class NFDist(BaseJointPriorDist):
         elif self.kwargs["model_type"] == "MaskedAutoregressiveFlow":
             raise NotImplementedError("MaskedAutoregressiveFlow is not implemented in bilby yet.")
             
-            # # TODO: check this before uncommenting
-            # flow = MaskedAutoregressiveFlow(
-            #     n_inputs=self.kwargs["n_inputs"],
-            #     n_transforms=self.kwargs["n_transforms"],
-            #     n_neurons=self.kwargs["n_neurons"],
-            #     n_blocks_per_transform=self.kwargs["n_blocks_per_transform"]
-            # )
-            
         elif self.kwargs["model_type"] == "Triangular":
-            raise NotImplementedError("MaskedAutoregressiveFlow is not implemented in bilby yet.")
-            
-            # # TODO: check this before uncommenting
-            # flow = MaskedAutoregressiveFlow(
-            #     n_inputs=self.kwargs["n_inputs"],
-            #     n_transforms=self.kwargs["n_transforms"],
-            #     n_neurons=self.kwargs["n_neurons"],
-            #     n_blocks_per_transform=self.kwargs["n_blocks_per_transform"]
-            # )
+            raise NotImplementedError("Triangular flow is not implemented in bilby yet.")
             
         else:
             raise ValueError(f"Unsupported glasflow model type: {self.kwargs['model_type']}")
@@ -1101,112 +1068,26 @@ class NFDist(BaseJointPriorDist):
         # Test sample
         with torch.inference_mode():
             self.nf.sample(100)
+    
+    def nf_sample_glasflow(self, size):
+        """Glasflow sampling function."""
+        with torch.inference_mode():
+            flow_samp = self.nf.sample(int(size))
+            return flow_samp.cpu().numpy()
             
-    def _setup_flowjax_model(self):
-        """Set up flowjax model."""
-        # Create base distribution
-        base_dist = Normal(jnp.zeros(self.kwargs["n_inputs"]))
-        key = jr.key(42)
-        
-        # Choose flow type based on model type in kwargs
-        model_type = self.kwargs.get("model_type", "block_neural_autoregressive_flow")
-        print(f"Using flowJAX model type: {model_type}")
-        
-        if model_type == "coupling_flow":
-            flow = coupling_flow(
-                key=key,
-                base_dist=base_dist,
-                flow_layers=self.kwargs["n_transforms"],
-                nn_width=self.kwargs["n_neurons"],
-                nn_depth=self.kwargs["nn_depth"]
-            )
-        elif model_type == "masked_autoregressive_flow":
-            flow = masked_autoregressive_flow(
-                key=key,
-                base_dist=base_dist,
-                flow_layers=self.kwargs["n_transforms"],
-                nn_width=self.kwargs["n_neurons"],
-                nn_depth=self.kwargs["nn_depth"]
-            )
-        elif model_type == "block_neural_autoregressive_flow":
-            flow = block_neural_autoregressive_flow(
-                key=key,
-                base_dist=base_dist,
-                nn_depth=self.kwargs["nn_depth"],
-                nn_block_dim=self.kwargs["nn_block_dim"],
-                flow_layers=self.kwargs["flow_layers"],
-            )
-        else:
-            raise ValueError(f"Unsupported flowJAX model type: {model_type}")
-        
-        # Load the trained model
-        logger.info(f"Loading flowJAX model from {self.flow_filename}")
-        self.nf = eqx.tree_deserialise_leaves(self.flow_filename, flow)
-        
-        # Test sample
-        key = jr.key(123)
-        test_samples = self.nf.sample(key, (100,))
-        
-    def _setup_glasflow_functions(self):
-        """Set up glasflow-specific sampling and log prob functions."""
-        def nf_sample_glasflow(size):
-            with torch.inference_mode():
-                flow_samp = self.nf.sample(int(size))
-                return flow_samp.cpu().numpy()
-                
-        def nf_ln_prob_glasflow(samp):
-            with torch.inference_mode():
-                samp_tensor = torch.tensor(samp, dtype=torch.float32)
-                log_probs = self.nf.log_prob(samp_tensor)
-                return log_probs.cpu().numpy()
-                
-        def nf_inverse_glasflow(samp):
-            with torch.inference_mode():
-                samp_tensor = torch.tensor(samp, dtype=torch.float32)
-                flow_samp, _ = self.nf.inverse(samp_tensor)
-                return flow_samp.cpu().numpy()
-                
-        self.nf_sample = nf_sample_glasflow
-        self.nf_ln_prob = nf_ln_prob_glasflow
-        self.nf_inverse = nf_inverse_glasflow
-        
-    def _setup_flowjax_functions(self):
-        """Set up flowjax-specific sampling and log prob functions."""
-        def nf_sample_flowjax(size):
-            key = jr.key(np.random.randint(0, 2**31))
-            keys = jr.split(key, int(size))
+    def nf_ln_prob_glasflow(self, samp):
+        """Glasflow log probability function."""
+        with torch.inference_mode():
+            samp_tensor = torch.tensor(samp, dtype=torch.float32)
+            log_probs = self.nf.log_prob(samp_tensor)
+            return log_probs.cpu().numpy()
             
-            # TODO: figure out if passing size isn't better?``
-            @jax.jit
-            def sample_fn(sample_key):
-                return self.nf.sample(sample_key, (1,)).flatten()
-            
-            # Vectorize over keys
-            samples_jax = jax.vmap(sample_fn)(keys)
-            return np.array(samples_jax)
-        
-        # TODO: JIT or vmap?
-        def nf_ln_prob_flowjax(samp):
-            samp_jax = jnp.array(samp, dtype=jnp.float32)
-            log_probs = self.nf.log_prob(samp_jax)
-            return np.array(log_probs)
-            
-        # TODO: JIT or vmap?
-        def nf_inverse_flowjax(samp):
-            samp_jax = jnp.array(samp, dtype=jnp.float32)
-            # FlowJAX expects 1D input for single samples, 2D for batches
-            if len(samp_jax.shape) == 2 and samp_jax.shape[0] == 1:
-                samp_jax = samp_jax.flatten()
-                flow_samp = self.nf.bijection.inverse(samp_jax)
-                return np.array(flow_samp).reshape(1, -1)
-            else:
-                # Handle batch case
-                flow_samp = self.nf.bijection.inverse(samp_jax)
-                return np.array(flow_samp)
-            
-        self.nf_sample = nf_sample_flowjax
-        self.nf_ln_prob = nf_ln_prob_flowjax
-        self.nf_inverse = nf_inverse_flowjax
+    def nf_inverse_glasflow(self, samp):
+        """Glasflow inverse function."""
+        with torch.inference_mode():
+            samp_tensor = torch.tensor(samp, dtype=torch.float32)
+            flow_samp, _ = self.nf.inverse(samp_tensor)
+            return flow_samp.cpu().numpy()
         
     def clean_samples(self, samp):
         """
@@ -1262,8 +1143,8 @@ class NFDist(BaseJointPriorDist):
         if self.scaler is not None:
             samp = self.scaler.transform(samp)
             
-        # Get the log-probability using the modular function
-        log_probs = self.nf_ln_prob(samp)
+        # Get the log-probability using the glasflow function
+        log_probs = self.nf_ln_prob_glasflow(samp)
         
         # Apply Jacobian correction for the rescaling transformation
         log_probs = log_probs + self.log_jacobian_correction
@@ -1275,14 +1156,14 @@ class NFDist(BaseJointPriorDist):
         return lnprob
     
     def _sample(self, size, **kwargs):
-        # Generate samples using the modular function
-        flow_samp = self.nf_sample(int(size))
+        # Generate samples using the glasflow function
+        flow_samp = self.nf_sample_glasflow(int(size))
         
         # Rescale the samples with sklearn's MinMaxScaler
         if self.scaler is not None:
             flow_samp = self.scaler.inverse_transform(flow_samp)
         
-        # Clean the samples -- return as float64 to not break dynesty # TODO: does this comment still apply?
+        # Clean the samples -- return as float64 to not break dynesty
         flow_samp = self.clean_samples(flow_samp)
         
         return flow_samp
@@ -1296,18 +1177,19 @@ class NFDist(BaseJointPriorDist):
         if len(mvg_samp.shape) == 1:
             mvg_samp = mvg_samp.reshape(1, self.num_vars)
         
-        # Use the modular inverse function
-        flow_samp = self.nf_inverse(mvg_samp)
+        # Use the glasflow inverse function
+        flow_samp = self.nf_inverse_glasflow(mvg_samp)
         
         # Rescale the samples with sklearn's MinMaxScaler
         if self.scaler is not None:
             flow_samp = self.scaler.inverse_transform(flow_samp)
     
         # FIXME: if the NF is trained better, this should no longer be necessary!
-        # Clean the samples -- return as float64 to not break dynesty # TODO: does this comment still apply?
+        # Clean the samples -- return as float64 to not break dynesty
         flow_samp = self.clean_samples(flow_samp)
     
         return flow_samp
+
 
 class NFPrior(JointPrior):
     """This is partly inspired by Ann-Kristin Malz's code, glitchflow, available at https://zenodo.org/records/15316399"""
@@ -1328,7 +1210,7 @@ class NFPrior(JointPrior):
             the logp value for the prior at given sample
         """
         try:
-            val = float(val) # TODO: remove if OK?
+            val = float(val)
         except Exception as e:
             print(f"At this point, we cannot create a float from {val}, error: {e}")
         self.dist.requested_parameters[self.name] = val
@@ -1368,10 +1250,8 @@ class NFPrior(JointPrior):
         else:
             # if not all parameters have been requested yet, just return 0
             if isinstance(val, (float, int, np.int32)):
-                # return np.array([0.0]) # this is for nessai
                 return 0.0
             else:
-
                 try:
                     # check value has a length
                     len(val)
