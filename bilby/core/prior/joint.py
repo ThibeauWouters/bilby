@@ -1337,6 +1337,9 @@ class NFDistJester(BaseJointPriorDist):
             bounds = self._infer_bounds(metadata)
             logger.info(f"Inferred bounds from flow metadata: {bounds}")
 
+        self.flow_dir = flow_dir
+        self.seed = seed
+
         super(NFDistJester, self).__init__(names=names, bounds=bounds)
 
         # JAX PRNG state — incremented on each _sample call
