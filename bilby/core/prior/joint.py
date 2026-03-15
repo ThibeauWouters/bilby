@@ -9,13 +9,21 @@ from .base import Prior, PriorException
 from ..utils import logger, infer_args_from_method, get_dict_with_properties
 from ..utils import random
 
-### glasflow
 import json
-from glasflow.flows import RealNVP
-from glasflow.flows.nsf import CouplingNSF
-import torch
-from sklearn.preprocessing import MinMaxScaler
-import joblib
+
+### glasflow (optional — only needed for NFDist/NFPrior)
+try:
+    from glasflow.flows import RealNVP
+    from glasflow.flows.nsf import CouplingNSF
+    import torch
+    from sklearn.preprocessing import MinMaxScaler
+    import joblib
+except ImportError:
+    RealNVP = None
+    CouplingNSF = None
+    torch = None
+    MinMaxScaler = None
+    joblib = None
 
 class BaseJointPriorDist(object):
     def __init__(self, names, bounds=None):
@@ -1260,3 +1268,210 @@ class NFPrior(JointPrior):
 
                 ret = np.zeros_like(val)
                 return ret
+
+
+class NFDistJester(BaseJointPriorDist):
+    """Normalizing flow distribution backed by a jester-trained flowjax model.
+
+    Unlike NFDist (which uses glasflow/PyTorch), this class loads flows trained
+    with jester's train_jester_flow pipeline (JAX/flowjax/equinox). The Flow
+    object handles all standardization and Jacobian corrections internally.
+
+    Note: rescaling from the unit hypercube (needed by nested samplers such as
+    dynesty) is not supported. Use MCMC-based samplers (e.g. bilby's emcee or
+    nessai) with this prior.
+
+    Parameters
+    ----------
+    names : list[str]
+        Parameter names. Must match the order in the trained flow's metadata.
+    flow_dir : str
+        Path to the directory produced by jester's train_jester_flow, containing
+        flow_weights.eqx, flow_kwargs.json, and metadata.json.
+    bounds : list[tuple] or None
+        Parameter bounds as [(min, max), ...]. If None, bounds are inferred from
+        the flow's training data statistics (mean ± 5*std for z-score flows, or
+        [data_min, data_max] for min-max flows).
+    seed : int
+        Base seed for the JAX PRNG key. The key is incremented on each call to
+        _sample so that successive calls return independent samples.
+    """
+
+    def __init__(
+        self,
+        names: list,
+        flow_dir: str,
+        bounds=None,
+        seed: int = 0,
+    ):
+        try:
+            import jax
+            import jax.numpy as jnp
+            from jesterTOV.inference.flows import Flow
+        except ImportError as e:
+            raise ImportError(
+                "NFDistJester requires jax and jesterTOV to be installed. "
+                f"Original error: {e}"
+            )
+
+        if not os.path.isdir(flow_dir):
+            raise FileNotFoundError(f"Flow directory does not exist: {flow_dir}")
+
+        logger.info(f"Loading jester flow from {flow_dir}")
+        self._flow = Flow.from_directory(flow_dir)
+
+        # Read parameter names from metadata to validate ordering
+        import json as _json
+        metadata_path = os.path.join(flow_dir, "metadata.json")
+        with open(metadata_path, "r") as f:
+            metadata = _json.load(f)
+        flow_param_names = metadata.get("parameter_names", None)
+        if flow_param_names is not None and list(names) != list(flow_param_names):
+            raise ValueError(
+                f"Provided names {names} do not match the flow's parameter names "
+                f"{flow_param_names}. The order must match exactly."
+            )
+
+        # Infer bounds from flow metadata if not provided
+        if bounds is None:
+            bounds = self._infer_bounds(metadata)
+            logger.info(f"Inferred bounds from flow metadata: {bounds}")
+
+        super(NFDistJester, self).__init__(names=names, bounds=bounds)
+
+        # JAX PRNG state — incremented on each _sample call
+        self._jax_key = jax.random.key(seed)
+        self._jax = jax
+        self._jnp = jnp
+
+        logger.info(
+            f"Loaded NFDistJester with n_dim={self.num_vars}, "
+            f"standardization={self._flow.standardization_method}"
+        )
+
+    def _infer_bounds(self, metadata: dict) -> list:
+        """Infer parameter bounds from flow training metadata."""
+        import numpy as _np
+
+        if "data_mean" in metadata and "data_std" in metadata:
+            # Z-score flow: use mean ± 5*std as generous bounds
+            means = _np.array(metadata["data_mean"])
+            stds = _np.array(metadata["data_std"])
+            return [(float(means[i] - 5 * stds[i]), float(means[i] + 5 * stds[i]))
+                    for i in range(len(means))]
+        elif "data_bounds_min" in metadata and "data_bounds_max" in metadata:
+            # Min-max flow: use training data bounds
+            mins = _np.array(metadata["data_bounds_min"])
+            maxs = _np.array(metadata["data_bounds_max"])
+            return [(float(mins[i]), float(maxs[i])) for i in range(len(mins))]
+        else:
+            raise ValueError(
+                "Cannot infer bounds: metadata missing both "
+                "(data_mean, data_std) and (data_bounds_min, data_bounds_max). "
+                "Please provide bounds explicitly."
+            )
+
+    def _sample(self, size, **kwargs):
+        """Draw samples from the flow in original parameter space."""
+        # Advance the PRNG key so successive calls are independent
+        self._jax_key, subkey = self._jax.random.split(self._jax_key)
+        samples = self._flow.sample(subkey, (int(size),))
+        return np.array(samples, dtype=np.float64)
+
+    def _ln_prob(self, samp, lnprob, outbounds):
+        """Evaluate log probability using the jester flow.
+
+        The flow's log_prob already accounts for the standardization Jacobian.
+        Out-of-bounds samples (as determined by the parent class) are set to -inf.
+        """
+        jnp = self._jnp
+
+        # Reshape if needed (single sample)
+        if len(samp.shape) == 1:
+            samp = samp.reshape(1, self.num_vars)
+
+        x = jnp.array(samp, dtype=jnp.float64)
+        log_probs = np.array(self._flow.log_prob(x), dtype=np.float64)
+
+        lnprob[~outbounds] = log_probs[~outbounds]
+        lnprob[outbounds] = -np.inf
+        return lnprob
+
+    def _rescale(self, samp, **kwargs):
+        raise NotImplementedError(
+            "NFDistJester does not support rescaling from the unit hypercube. "
+            "Use an MCMC-based sampler (e.g. emcee or nessai) instead of "
+            "a nested sampler (dynesty)."
+        )
+
+
+class NFPriorJester(JointPrior):
+    """Single-parameter prior for use with NFDistJester.
+
+    Each parameter in the joint flow distribution gets its own NFPriorJester
+    instance that shares a single NFDistJester object. Create one instance per
+    parameter and pass the same dist object to all of them.
+
+    Example
+    -------
+    >>> from jesterTOV.inference.flows import Flow
+    >>> dist = NFDistJester(
+    ...     names=["chirp_mass_source", "mass_ratio", "lambda_1", "lambda_2"],
+    ...     flow_dir="/path/to/uniform_radio/",
+    ... )
+    >>> priors = {name: NFPriorJester(dist=dist, name=name) for name in dist.names}
+    """
+
+    def ln_prob(self, val):
+        """Return the log prior probability for this parameter.
+
+        Accumulates values across all parameters in the joint distribution and
+        evaluates once all have been provided (bilby's joint-prior protocol).
+        """
+        try:
+            val = float(val)
+        except Exception as e:
+            logger.debug(f"Could not cast {val} to float in NFPriorJester.ln_prob: {e}")
+
+        self.dist.requested_parameters[self.name] = val
+
+        if self.dist.filled_request():
+            values = list(self.dist.requested_parameters.values())
+
+            # Validate consistent lengths for array-valued inputs
+            for i in range(len(self.dist) - 1):
+                if isinstance(values[i], (list, np.ndarray)) or isinstance(
+                    values[i + 1], (list, np.ndarray)
+                ):
+                    if isinstance(values[i], (list, np.ndarray)) and isinstance(
+                        values[i + 1], (list, np.ndarray)
+                    ):
+                        if len(values[i]) != len(values[i + 1]):
+                            raise ValueError(
+                                "Each parameter must have the same number of "
+                                "requested values."
+                            )
+                    else:
+                        raise ValueError(
+                            "Each parameter must have the same number of "
+                            "requested values."
+                        )
+
+            lnp = np.atleast_1d(self.dist.ln_prob(np.asarray(values).T).squeeze())
+            try:
+                lnp = float(lnp)
+            except Exception as e:
+                logger.debug(f"Could not cast lnp to float in NFPriorJester: {e}")
+
+            self.dist.reset_request()
+            return lnp
+        else:
+            # Not all parameters have been set yet — return 0 as placeholder
+            if isinstance(val, (float, int, np.int32)):
+                return 0.0
+            else:
+                try:
+                    len(val)
+                except Exception as e:
+                    raise TypeError("Invalid type for ln_prob: {}".format(e))
+                return np.zeros_like(val)

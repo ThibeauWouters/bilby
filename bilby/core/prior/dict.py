@@ -17,11 +17,19 @@ from ..utils import (
 )
 
 # TODO: This is for the NF priors -- might have to replace this in a separate file, for now, keep it here
-import torch
-import joblib
+try:
+    import torch
+    import joblib
+except ImportError:
+    torch = None
+    joblib = None
 from scipy.stats import norm
-from glasflow.flows import RealNVP
-from glasflow.flows.autoregressive import MaskedAffineAutoregressiveFlow
+try:
+    from glasflow.flows import RealNVP
+    from glasflow.flows.autoregressive import MaskedAffineAutoregressiveFlow
+except ImportError:
+    RealNVP = None
+    MaskedAffineAutoregressiveFlow = None
 
 class PriorDict(dict):
     def __init__(self, dictionary=None, filename=None, conversion_function=None):
