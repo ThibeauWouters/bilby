@@ -252,6 +252,122 @@ class Uniform(Prior):
         _cdf = np.maximum(_cdf, 0)
         return _cdf
 
+class DoubleGaussian(Prior):
+    
+    def __init__(self, mu1, mu2, sigma1, sigma2, w, name=None, latex_label=None, unit=None, boundary=None):
+        """Double Gaussian prior with means [mu1,mu2], 
+        widths [sigma1,sigma2], and weight w 
+        
+        Parameters
+        ==========
+        mu1: float
+            Mean of the first Gaussian
+        mu2: float
+            Mean of the second Gaussian
+        sigma1:
+            width of the first Gaussian
+        sigma2:
+            width of the second Gaussian
+        w:
+            weight of the two first Gaussians (the second one is 1-w)
+        name: str
+            See superclass
+        latex_label: str
+            See superclass
+        unit: str
+            See superclass
+        boundary: str
+            See superclass          
+        """
+        
+        self.mu1 = mu1
+        self.mu2 = mu2
+        self.sigma1 = sigma1
+        self.sigma2 = sigma2
+        self.w = w
+        
+        super(DoubleGaussian,self).__init__(name=name,latex_label=latex_label, unit=unit, boundary=boundary)
+        
+        self._create_inverse()
+        
+    def rescale(self, val):
+        """
+        'Rescale' a sample from the unit line element to the appropriate Gaussian prior.
+
+        Parameters
+        ==========
+        val: Union[float, int, array_like]
+    
+        This maps to the inverse CDF. This has been analytically solved for this case.
+        """
+        
+        rescaled = self.inverse_cumulative_distribution(val)
+        if rescaled.shape == ():
+            rescaled = float(rescaled)
+        return rescaled
+    
+        ###TOFIX: add interpolation rescaling
+            
+        
+    def prob(self, val):
+        """Return the prior probability of val.
+
+        Parameters
+        ==========
+        val: Union[float, int, array_like]
+
+        Returns
+        =======
+        Union[float, array_like]: Prior probability of val
+        """
+            
+        gauss1 = np.exp(-(self.mu1 - val) ** 2 / (2 * self.sigma1 ** 2)) / (2 * np.pi) ** 0.5 / self.sigma1
+        gauss2 = np.exp(-(self.mu2 - val) ** 2 / (2 * self.sigma2 ** 2)) / (2 * np.pi) ** 0.5 / self.sigma2
+            
+        return self.w*gauss1 + (1 - self.w) * gauss2
+        
+    def ln_prob(self, val):
+        """Return the Log prior probability of val.
+
+        Parameters
+        ==========
+        val: Union[float, int, array_like]
+
+        Returns
+        =======
+        Union[float, array_like]: Prior probability of val
+        """
+            
+        with np.errstate(divide='ignore'):
+            return np.log(self.prob(val)) 
+
+    def cdf(self, val):
+        
+        cdf_gauss1 = (1 - erf((self.mu1 - val) / 2 ** 0.5 / self.sigma1)) / 2
+        cdf_gauss2 = (1 - erf((self.mu2 - val) / 2 ** 0.5 / self.sigma2)) / 2
+            
+        return w * cdf_gauss1 + (1 - w)*cdf_gauss2 
+
+
+    def _create_inverse(self):
+            
+        choices = np.random.choice([0, 1], size=100000, p=[self.w, 1-self.w])
+
+        # Draw samples accordingly
+        fake_samples = np.where(
+        choices == 0,
+                np.random.normal(self.mu1, self.sigma1, 100000),
+                np.random.normal(self.mu2, self.sigma2, 100000)
+        )
+            
+
+        ecdf_func = scipy.stats.ecdf(fake_samples)
+        x_sorted = np.sort(fake_samples)
+        y = ecdf_func.cdf.evaluate(x_sorted)
+        
+        
+        self.inverse_cumulative_distribution = scipy.interpolate.interp1d(y, x_sorted, bounds_error=False,
+                        fill_value=(x_sorted[0], x_sorted[-1]))
 
 class LogUniform(PowerLaw):
 
