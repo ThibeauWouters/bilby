@@ -293,6 +293,45 @@ class LALCBCWaveformGenerator(WaveformGenerator):
                 raise ValueError(f"For {waveform_approximant}, reference_frequency must equal minimum_frequency")
 
 
+class EOSConstrainedWaveformGenerator(LALCBCWaveformGenerator):
+    """LALCBCWaveformGenerator with tidal deformabilities fixed to a given EOS.
+
+    Lambda_1 and lambda_2 are no longer free parameters: they are derived by
+    interpolating a precomputed Lambda(M) table loaded from a jester-format NPZ
+    file, evaluated at the source-frame component masses.
+
+    Usage in a bilby_pipe INI config
+    ---------------------------------
+    Point both the analysis and injection WFGs at this class and supply the
+    absolute path to the jester EOS NPZ file via the constructor dicts::
+
+        waveform-generator = bilby.gw.waveform_generator.EOSConstrainedWaveformGenerator
+        waveform-generator-constructor-dict = {'eos_npz_path': '/abs/path/to/HQC18.npz'}
+        injection-waveform-generator-constructor-dict = {'eos_npz_path': '/abs/path/to/HQC18.npz'}
+
+    The prior file must NOT contain ``lambda_1`` or ``lambda_2`` — they are
+    derived quantities; the EOS table determines them from
+    ``mass_1_source`` / ``mass_2_source``.
+
+    Parameters
+    ----------
+    eos_npz_path : str
+        Path to the jester-format NPZ file for the desired EOS, e.g.
+        ``".../jesterTOV/tabulated_eos/lalsuite/HQC18.npz"``.
+        Must contain ``masses_EOS`` (solar masses) and ``Lambda_EOS``
+        (dimensionless tidal deformability) arrays.
+    **kwargs
+        Forwarded to ``LALCBCWaveformGenerator``.  If ``parameter_conversion``
+        is present (set by bilby_pipe), it is replaced by the EOS-constrained
+        conversion built from ``eos_npz_path``.
+    """
+
+    def __init__(self, eos_npz_path, **kwargs):
+        from .conversion import make_eos_file_conversion
+        kwargs["parameter_conversion"] = make_eos_file_conversion(eos_npz_path)
+        super().__init__(**kwargs)
+
+
 class GWSignalWaveformGenerator(WaveformGenerator):
     """
     A wrapper to the `gwsignal waveform generator`_ that allows for use of arbitrary

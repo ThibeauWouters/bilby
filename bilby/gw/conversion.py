@@ -10,6 +10,7 @@ import pickle
 
 import numpy as np
 from pandas import DataFrame, Series
+from scipy.interpolate import interp1d
 from scipy.stats import norm
 
 from .utils import (lalsim_SimNeutronStarEOS4ParamSDGammaCheck,
@@ -2607,3 +2608,78 @@ def identity_map_generation(sample, likelihood=None, priors=None, npool=1):
             )
 
     return output_sample
+
+
+def make_eos_file_conversion(npz_path):
+    """
+    Return a bilby ``parameter_conversion`` function that constrains the tidal
+    deformabilities (lambda_1, lambda_2) to a fixed equation of state described
+    by a precomputed Lambda(M) table stored in a jester-format NPZ file.
+
+    The NPZ file must contain the arrays ``masses_EOS`` (source-frame masses in
+    solar masses) and ``Lambda_EOS`` (dimensionless tidal deformabilities).
+    These files are produced by ``jesterTOV`` and live at::
+
+        jesterTOV/tabulated_eos/lalsuite/<EOS_NAME>.npz
+
+    At runtime lambda_1 and lambda_2 are obtained by interpolating the table
+    at ``mass_1_source`` and ``mass_2_source`` (i.e. the redshift-corrected,
+    source-frame component masses) so that the physical EOS relationship is
+    respected regardless of the event's luminosity distance.
+
+    Parameters
+    ==========
+    npz_path : str
+        Path to the jester NPZ file for the desired EOS (e.g.
+        ``"jesterTOV/tabulated_eos/lalsuite/SLY230A.npz"``).
+
+    Returns
+    =======
+    callable
+        A conversion function with the signature
+        ``(parameters: dict) -> (converted_parameters: dict, added_keys: list)``
+        suitable for passing as ``WaveformGenerator(..., parameter_conversion=...)``.
+
+    Notes
+    -----
+    * The interpolator is built once at factory-call time (not per likelihood
+      evaluation) so there is negligible runtime overhead.
+    * Masses outside the tabulated range return lambda = 0.  Callers that want
+      a hard prior cut at the maximum mass should check for this value in the
+      likelihood and return -inf.
+    * Any tidal keys that may have been set elsewhere (``lambda_tilde``,
+      ``delta_lambda_tilde``, ``lambda_symmetric``) are stripped before the
+      standard BNS conversion is invoked, ensuring only the EOS-table values
+      are used.
+    """
+    data = np.load(npz_path)
+    
+    # TODO: what to do with the left bound? Right bound is BH limit
+    def _lambda_of_mass(mass):
+        return np.interp(mass, data["masses_EOS"], data["Lambda_EOS"], right=0)
+
+    _TIDAL_KEYS = (
+        "lambda_1", "lambda_2",
+        "lambda_tilde", "delta_lambda_tilde",
+        "lambda_symmetric", "lambda_antisymmetric",
+    )
+
+    def _conversion(parameters):
+        # Strip tidal keys so the standard BNS pathway returns the early-exit
+        # (lambda_1 = lambda_2 = 0) path without interfering with our values.
+        stripped = {k: v for k, v in parameters.items() if k not in _TIDAL_KEYS}
+
+        converted, added_keys = convert_to_lal_binary_neutron_star_parameters(stripped)
+
+        # Ensure source-frame masses are present.  generate_source_frame_parameters
+        # derives them from mass_1/mass_2 and luminosity_distance via cosmology.
+        if "mass_1_source" not in converted:
+            converted = generate_source_frame_parameters(converted)
+
+        # Overwrite the placeholder zeros with EOS-table values.
+        converted["lambda_1"] = _lambda_of_mass(converted["mass_1_source"])
+        converted["lambda_2"] = _lambda_of_mass(converted["mass_2_source"])
+
+        return converted, added_keys
+
+    return _conversion
