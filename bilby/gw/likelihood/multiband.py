@@ -91,7 +91,8 @@ class MBGravitationalWaveTransient(GravitationalWaveTransient):
 
     """
     def __init__(
-            self, interferometers, waveform_generator, reference_chirp_mass=None, highest_mode=2,
+            self, interferometers, waveform_generator, eos_path=None, Neos=None, eos_weight_path=None,
+            with_eos=False, reference_chirp_mass=None, highest_mode=2,
             linear_interpolation=True, accuracy_factor=5, time_offset=None, delta_f_end=None,
             maximum_banding_frequency=None, minimum_banding_duration=0., weights=None,
             distance_marginalization=False, phase_marginalization=False, priors=None,
@@ -99,7 +100,9 @@ class MBGravitationalWaveTransient(GravitationalWaveTransient):
             reference_frame="sky", time_reference="geocenter"
     ):
         super(MBGravitationalWaveTransient, self).__init__(
-            interferometers=interferometers, waveform_generator=waveform_generator, priors=priors,
+            interferometers=interferometers, waveform_generator=waveform_generator,
+            eos_path=eos_path, Neos=Neos, eos_weight_path=eos_weight_path, with_eos=with_eos,
+            priors=priors,
             distance_marginalization=distance_marginalization, phase_marginalization=phase_marginalization,
             time_marginalization=time_marginalization,
             distance_marginalization_lookup_table=distance_marginalization_lookup_table,

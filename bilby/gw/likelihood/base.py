@@ -9,6 +9,7 @@ from scipy.special import logsumexp
 from ...core.likelihood import Likelihood, _fallback_to_parameters
 from ...core.utils import logger, BoundedRectBivariateSpline, create_time_series
 from ...core.prior import Interped, Prior, Uniform, DeltaFunction
+from ..conversion import EOSConversion
 from ..detector import InterferometerList, get_empty_interferometer, calibration
 from ..prior import BBHPriorDict, Cosmological
 from ..utils import noise_weighted_inner_product, zenith_azimuth_to_ra_dec, ln_i0
@@ -143,12 +144,26 @@ class GravitationalWaveTransient(Likelihood):
             }
 
     def __init__(
-            self, interferometers, waveform_generator, time_marginalization=False,
+            self, interferometers, waveform_generator, eos_path=None, Neos=None, eos_weight_path=None,
+            with_eos=False, time_marginalization=False,
             distance_marginalization=False, phase_marginalization=False, calibration_marginalization=False, priors=None,
             distance_marginalization_lookup_table=None, calibration_lookup_table=None,
             number_of_response_curves=1000, starting_index=0, jitter_time=True, reference_frame="sky",
             time_reference="geocenter"
     ):
+
+        if with_eos:
+            xx = np.arange(0, Neos + 1)
+            eos_weight = np.loadtxt(eos_weight_path)
+            yy = np.concatenate((eos_weight, [eos_weight[-1]]))
+            eos_prior = Interped(xx, yy, minimum=0, maximum=Neos, name='EOS')
+            priors['EOS'] = eos_prior
+
+            # construct the eos conversion
+            parameter_conversion_class = EOSConversion(eos_data_path=eos_path, Neos=Neos)
+            priors.conversion_function = parameter_conversion_class.priors_conversion_function
+            parameter_conversion = parameter_conversion_class.convert_to_multimessenger_parameters
+            waveform_generator.parameter_conversion = parameter_conversion
 
         self.waveform_generator = waveform_generator
         super(GravitationalWaveTransient, self).__init__()

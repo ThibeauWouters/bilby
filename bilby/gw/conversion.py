@@ -8,7 +8,9 @@ import sys
 import multiprocessing
 import pickle
 
+import lal
 import numpy as np
+import pandas as pd
 from pandas import DataFrame, Series
 from scipy.stats import norm
 
@@ -2551,6 +2553,197 @@ def fill_sample(args):
     sample = dict(sample).copy()
     new_sample = likelihood.generate_posterior_sample_from_marginalized_likelihood(sample)
     return tuple((new_sample[key] for key in marginalized_parameters))
+
+
+def Hubble_constant_to_distance(converted_parameters, added_keys):
+    if "redshift" in converted_parameters.keys() and "Hubble_constant" in converted_parameters.keys():
+        import scipy.constants
+        Hubble_constant = converted_parameters["Hubble_constant"]
+        redshift = converted_parameters["redshift"]
+        distance = redshift / Hubble_constant * scipy.constants.c / 1e3
+        converted_parameters["luminosity_distance"] = distance
+        added_keys = added_keys + ["luminosity_distance"]
+    return converted_parameters, added_keys
+
+
+def source_frame_masses(converted_parameters, added_keys):
+    if "redshift" not in converted_parameters.keys():
+        distance = converted_parameters["luminosity_distance"]
+        if hasattr(distance, '__len__') and len(distance) > 50:
+            from astropy import units
+            from astropy import cosmology as cosmo
+            cosmology = cosmo.Planck15
+            zmin = cosmo.z_at_value(cosmology.luminosity_distance, distance.min() * units.Mpc)
+            zmax = cosmo.z_at_value(cosmology.luminosity_distance, distance.max() * units.Mpc)
+            zgrid = np.geomspace(zmin, zmax, 50)
+            distance_grid = cosmology.luminosity_distance(zgrid).value
+            converted_parameters["redshift"] = np.interp(distance, distance_grid, zgrid)
+        else:
+            converted_parameters["redshift"] = luminosity_distance_to_redshift(distance)
+        added_keys = added_keys + ["redshift"]
+
+    if "mass_1_source" not in converted_parameters.keys():
+        z = converted_parameters["redshift"]
+        converted_parameters["mass_1_source"] = converted_parameters["mass_1"] / (1 + z)
+        added_keys = added_keys + ["mass_1_source"]
+
+    if "mass_2_source" not in converted_parameters.keys():
+        z = converted_parameters["redshift"]
+        converted_parameters["mass_2_source"] = converted_parameters["mass_2"] / (1 + z)
+        added_keys = added_keys + ["mass_2_source"]
+
+    return converted_parameters, added_keys
+
+
+def EOS2Parameters(mass_val, radius_val, Lambda_val, mass_1_source, mass_2_source):
+    TOV_mass = mass_val.max()
+    TOV_radius = radius_val[np.argmax(mass_val)]
+    minimum_mass = mass_val.min()
+
+    if mass_1_source < minimum_mass or mass_1_source > TOV_mass:
+        lambda_1 = np.array([0.0])
+        radius_1 = np.array([2.0 * mass_1_source * lal.MRSUN_SI / 1e3])
+    else:
+        lambda_1 = np.array(np.interp(mass_1_source, mass_val, Lambda_val)).reshape(1)
+        radius_1 = np.array(np.interp(mass_1_source, mass_val, radius_val)).reshape(1)
+
+    if mass_2_source < minimum_mass or mass_2_source > TOV_mass:
+        lambda_2 = np.array([0.0])
+        radius_2 = np.array([2.0 * mass_2_source * lal.MRSUN_SI / 1e3])
+    else:
+        lambda_2 = np.array(np.interp(mass_2_source, mass_val, Lambda_val)).reshape(1)
+        radius_2 = np.array(np.interp(mass_2_source, mass_val, radius_val)).reshape(1)
+
+    R_14 = np.interp(1.4, mass_val, radius_val)
+    R_16 = np.interp(1.6, mass_val, radius_val)
+
+    return TOV_mass, TOV_radius, lambda_1, lambda_2, radius_1, radius_2, R_14, R_16
+
+
+class EOSConversion(object):
+
+    def __init__(self, eos_data_path, Neos):
+        self.eos_data_path = eos_data_path
+        self.Neos = Neos
+
+    def convert_to_multimessenger_parameters(self, parameters):
+        converted_parameters = parameters.copy()
+        original_keys = list(converted_parameters.keys())
+        converted_parameters, added_keys = convert_to_lal_binary_black_hole_parameters(
+            converted_parameters
+        )
+        converted_parameters, added_keys = Hubble_constant_to_distance(
+            converted_parameters, added_keys
+        )
+        converted_parameters, added_keys = source_frame_masses(
+            converted_parameters, added_keys
+        )
+        mass_1_source = converted_parameters["mass_1_source"]
+        mass_2_source = converted_parameters["mass_2_source"]
+
+        if "EOS" in converted_parameters:
+            if isinstance(
+                converted_parameters["EOS"],
+                (list, tuple, pd.core.series.Series, np.ndarray),
+            ):
+                TOV_radius_list = []
+                TOV_mass_list = []
+                lambda_1_list = []
+                lambda_2_list = []
+                radius_1_list = []
+                radius_2_list = []
+                R_14_list = []
+                R_16_list = []
+                EOSID = np.array(converted_parameters["EOS"]).astype(int) + 1
+                EOSdata = [None] * self.Neos
+                for j in np.unique(EOSID):
+                    EOSdata[j - 1] = np.loadtxt(f"{self.eos_data_path}/{j}.dat", usecols=[0, 1, 2]).T
+
+                for i in range(0, len(EOSID)):
+                    radius_val, mass_val, Lambda_val = EOSdata[EOSID[i] - 1]
+                    (
+                        TOV_mass, TOV_radius,
+                        lambda_1, lambda_2,
+                        radius_1, radius_2,
+                        R_14, R_16
+                    ) = EOS2Parameters(
+                        mass_val, radius_val, Lambda_val,
+                        mass_1_source[i], mass_2_source[i],
+                    )
+                    TOV_radius_list.append(TOV_radius)
+                    TOV_mass_list.append(TOV_mass)
+                    lambda_1_list.append(lambda_1[0])
+                    lambda_2_list.append(lambda_2[0])
+                    radius_1_list.append(radius_1[0])
+                    radius_2_list.append(radius_2[0])
+                    R_14_list.append(R_14)
+                    R_16_list.append(R_16)
+
+                converted_parameters["TOV_mass"] = np.array(TOV_mass_list)
+                converted_parameters["TOV_radius"] = np.array(TOV_radius_list)
+                converted_parameters["radius_1"] = np.array(radius_1_list)
+                converted_parameters["radius_2"] = np.array(radius_2_list)
+                converted_parameters["lambda_1"] = np.array(lambda_1_list)
+                converted_parameters["lambda_2"] = np.array(lambda_2_list)
+                converted_parameters["R_14"] = np.array(R_14_list)
+                converted_parameters["R_16"] = np.array(R_16_list)
+
+            else:
+                EOSID = int(converted_parameters["EOS"]) + 1
+                radius_val, mass_val, Lambda_val = np.loadtxt(
+                    f"{self.eos_data_path}/{EOSID}.dat", unpack=True, usecols=[0, 1, 2]
+                )
+                (
+                    TOV_mass, TOV_radius,
+                    lambda_1, lambda_2,
+                    radius_1, radius_2,
+                    R_14, R_16
+                ) = EOS2Parameters(
+                    mass_val, radius_val, Lambda_val,
+                    mass_1_source, mass_2_source
+                )
+                converted_parameters["TOV_radius"] = TOV_radius
+                converted_parameters["TOV_mass"] = TOV_mass
+                converted_parameters["radius_1"] = radius_1[0]
+                converted_parameters["radius_2"] = radius_2[0]
+                converted_parameters["lambda_1"] = lambda_1[0]
+                converted_parameters["lambda_2"] = lambda_2[0]
+                converted_parameters["R_14"] = R_14
+                converted_parameters["R_16"] = R_16
+
+            added_keys = added_keys + [
+                "lambda_1", "lambda_2", "TOV_mass", "TOV_radius",
+                "radius_1", "radius_2", "R_14", "R_16",
+            ]
+
+        added_keys = [
+            key for key in converted_parameters.keys() if key not in original_keys
+        ]
+        return converted_parameters, added_keys
+
+    def generate_all_parameters(self, sample, likelihood=None, priors=None, npool=1):
+        waveform_defaults = {
+            "reference_frequency": 50.0,
+            "waveform_approximant": "TaylorF2",
+            "minimum_frequency": 20.0,
+        }
+        output_sample = _generate_all_cbc_parameters(
+            sample,
+            defaults=waveform_defaults,
+            base_conversion=self.convert_to_multimessenger_parameters,
+            likelihood=likelihood,
+            priors=priors,
+            npool=npool,
+        )
+        output_sample = generate_tidal_parameters(output_sample)
+        return output_sample
+
+    def priors_conversion_function(self, sample):
+        out_sample = sample.copy()
+        out_sample, _ = self.convert_to_multimessenger_parameters(out_sample)
+        out_sample = generate_mass_parameters(out_sample)
+        out_sample = generate_tidal_parameters(out_sample)
+        return out_sample
 
 
 def identity_map_conversion(parameters):
