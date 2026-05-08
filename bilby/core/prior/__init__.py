@@ -4,4 +4,5 @@ from .conditional import *
 from .dict import *
 from .interpolated import *
 from .joint import *
+from .neural_priors import *
 from .slabspike import *
