@@ -9,6 +9,7 @@ from pathlib import Path
 import numpy as np
 
 from .joint import BaseJointPriorDist, JointPrior, MultivariateGaussianDist
+from .dict import PriorDict
 from ..utils import logger
 
 import joblib
@@ -162,10 +163,41 @@ class NFPrior(JointPrior):
     def ln_prob(self, val):
         """Return the log prior probability for this parameter.
 
-        Accumulates values across all parameters in the joint distribution and
-        evaluates the full log-prob once all have been provided (bilby's
-        joint-prior protocol).
+        Handles three call patterns:
+
+        1. Normal scalar accumulation (e.g. from priors.ln_prob with scalar
+           params): each NFPrior stores its value and the last one to be
+           called evaluates the full joint log-prob.
+
+        2. Empty-list placeholder from the bilby joint-prior rescale protocol
+           (dynesty prior_transform path): PriorDict.rescale returns [] for
+           the first N-1 parameters and the full (N,) rescaled sample for the
+           Nth.  Empty-list calls return 0.0 immediately.
+
+        3. Full-sample array (the Nth parameter in case 2): evaluate the
+           joint log-prob directly using the complete rescaled sample.
         """
+        # Case 2: empty-list placeholder from the rescale protocol
+        if isinstance(val, list) and len(val) == 0:
+            return 0.0
+
+        # Case 3: full rescaled sample array from the rescale protocol.
+        # The last parameter in the joint group receives the complete (N,)
+        # array produced by _rescale; evaluate log_prob directly.
+        if (
+            isinstance(val, np.ndarray)
+            and val.ndim == 1
+            and len(val) == self.dist.num_vars
+        ):
+            samp = val.reshape(1, -1).astype(np.float64)
+            lnp = np.atleast_1d(self.dist.ln_prob(samp).squeeze())
+            self.dist.reset_request()
+            try:
+                return lnp.item()
+            except ValueError:
+                return lnp
+
+        # Case 1: normal scalar path
         try:
             val = float(val)
         except Exception as e:
@@ -198,7 +230,7 @@ class NFPrior(JointPrior):
             try:
                 lnp = lnp.item()
             except ValueError:
-                pass  # lnp is a multi-element array (vectorised call); keep as-is
+                pass  # vectorised call; keep as-is
 
             self.dist.reset_request()
             return lnp
@@ -211,3 +243,55 @@ class NFPrior(JointPrior):
                 except Exception as e:
                     raise TypeError(f"Invalid type for ln_prob: {e}")
                 return np.zeros_like(val)
+
+
+class NFPriorDict(PriorDict):
+    """PriorDict subclass that correctly handles NFPrior in nested samplers.
+
+    bilby's standard PriorDict.rescale uses a joint-prior accumulation protocol
+    that returns [] for the first N-1 parameters in a joint group and the full
+    (N,) rescaled array for the last.  The resulting list
+    ``[[], [], ..., array([a, b, ..., n])]`` breaks evaluate_constraints and
+    log_likelihood because they expect a flat list of scalar parameter values.
+
+    This subclass post-processes the raw rescale output and flattens each joint
+    prior group into individual scalar values so that downstream bilby / dynesty
+    code works without modification.
+
+    Use this dict whenever NFPrior objects are part of a nested-sampler run:
+
+        dist = NFDist(names=[...], flow_dir=..., bounds=[...])
+        priors = NFPriorDict({name: NFPrior(dist=dist, name=name) for name in dist.names})
+        bilby.run_sampler(likelihood=..., priors=priors, sampler="dynesty", ...)
+    """
+
+    def rescale(self, keys, theta):
+        raw = super().rescale(keys, theta)
+
+        # Fast path: no joint-prior placeholders present.
+        if not any(isinstance(r, list) and len(r) == 0 for r in raw):
+            return raw
+
+        # Flatten: the bilby joint-prior protocol produces
+        #   [[], [], ..., array([v0, v1, ..., vN-1])]
+        # for each group of N joint parameters (empties for 0..N-2, full array
+        # for N-1).  Replace each group with individual scalar values.
+        result = []
+        pending_empties = 0
+        for r in raw:
+            if isinstance(r, list) and len(r) == 0:
+                pending_empties += 1
+                result.append(r)  # temporary placeholder
+            elif (
+                isinstance(r, np.ndarray)
+                and r.ndim == 1
+                and pending_empties == len(r) - 1
+            ):
+                for i in range(pending_empties):
+                    result[-(pending_empties - i)] = float(r[i])
+                result.append(float(r[-1]))
+                pending_empties = 0
+            else:
+                pending_empties = 0
+                result.append(r)
+        return result

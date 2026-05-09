@@ -57,7 +57,11 @@ class PriorDict(dict):
     def evaluate_constraints(self, sample):
         out_sample = self.conversion_function(sample)
         try:
-            prob = np.ones_like(next(iter(out_sample.values())))
+            first_val = next(iter(out_sample.values()))
+            # np.ones_like([]) returns array([]) which raises ValueError in
+            # boolean context (e.g. `if evaluate_constraints(...):`).
+            # Fall back to scalar 1 when the first value is a list placeholder.
+            prob = 1 if isinstance(first_val, list) else np.ones_like(first_val)
         except TypeError:
             prob = np.ones_like(out_sample)
         for key in self:
@@ -635,9 +639,33 @@ class PriorDict(dict):
         =======
         list: List of floats containing the rescaled sample
         """
-        return list(
-            [self[key].rescale(sample) for key, sample in zip(keys, theta)]
-        )
+        result = [self[key].rescale(sample) for key, sample in zip(keys, theta)]
+        # Flatten joint-prior groups produced by the bilby JointPrior protocol.
+        # That protocol returns [] for the first N-1 parameters of a joint group
+        # and array([v0, ..., vN-1]) for the last.  Post-process so downstream
+        # code (evaluate_constraints, log_likelihood) always sees plain scalars.
+        if not any(isinstance(r, list) for r in result):
+            return result
+        flattened = []
+        pending = 0
+        for r in result:
+            if isinstance(r, list) and len(r) == 0:
+                pending += 1
+                flattened.append(r)  # temporary placeholder; filled below
+            elif (
+                isinstance(r, np.ndarray)
+                and r.ndim == 1
+                and pending == len(r) - 1
+            ):
+                # Replace the N-1 empty placeholders with the first N-1 scalars
+                for i in range(pending):
+                    flattened[-(pending - i)] = float(r[i])
+                flattened.append(float(r[-1]))
+                pending = 0
+            else:
+                pending = 0
+                flattened.append(r)
+        return flattened
 
     def test_redundancy(self, key, disable_logging=False):
         """Empty redundancy test, should be overwritten in subclasses"""
