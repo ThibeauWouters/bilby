@@ -27,8 +27,9 @@ class NFDist(BaseJointPriorDist):
     flow_dir : str
         Path to the model directory produced by neural_priors_gym's FlowTrainer.
     bounds : list[tuple] or None
-        Parameter bounds as [(min, max), ...]. If None, no explicit bounds are
-        enforced beyond what the bilby JointPrior framework handles.
+        Parameter bounds as ``[(min, max), ...]`` aligned with ``names``. Either
+        element may be ``None`` to mean ±inf, e.g. ``(None, 5.0)``. If ``None``,
+        all parameters are unbounded.
     """
 
     def __init__(self, names: list, flow_dir: str, bounds=None):
@@ -56,7 +57,17 @@ class NFDist(BaseJointPriorDist):
         if bounds is None:
             bounds = [(-np.inf, np.inf)] * len(names)
 
-        super().__init__(names=names, bounds=bounds)
+        # Resolve None to inf; _bounds_dict is used internally for clipping.
+        self._bounds_dict = {
+            name: (
+                -np.inf if lo is None else lo,
+                np.inf if hi is None else hi,
+            )
+            for name, (lo, hi) in zip(names, bounds)
+        }
+        resolved_bounds = [self._bounds_dict[name] for name in names]
+
+        super().__init__(names=names, bounds=resolved_bounds)
 
         # Standard normal base distribution used by _rescale for nested samplers
         mvg_names = [f"x{i}" for i in range(1, len(names) + 1)]
@@ -72,14 +83,25 @@ class NFDist(BaseJointPriorDist):
             f"Loaded NFDist with n_dim={self.num_vars} from {flow_dir}"
         )
 
+    def _clip_samples(self, samples: np.ndarray) -> np.ndarray:
+        """Clip samples to the declared bounds (column order matches self.names).
+
+        Columns whose bound is ±inf are left untouched. This is a soft clip —
+        samples are moved to the boundary rather than rejected.
+        """
+        samples = samples.copy()
+        for col, name in enumerate(self.names):
+            lo, hi = self._bounds_dict[name]
+            samples[:, col] = np.clip(samples[:, col], lo, hi)
+        return samples
+
     def _sample(self, size, **_kwargs):
         """Draw samples from the flow in the original (unscaled) parameter space."""
         raw = self._flow.sample(int(size))
         if self.scaler is not None:
             raw = self.scaler.inverse_transform(raw)
-        # TODO: add optional post-sampling clipping/rejection for domain-specific
-        # constraints (e.g. physicality cuts on masses or tidal parameters).
-        return raw.astype(np.float64)
+        raw = self._clip_samples(raw.astype(np.float64))
+        return raw
 
     def _ln_prob(self, samp, lnprob, outbounds):
         """Evaluate log probability of samples.
@@ -87,10 +109,6 @@ class NFDist(BaseJointPriorDist):
         Transforms to the scaled space used during training, evaluates the flow
         log-prob, and applies the Jacobian correction for the scaler.
         """
-        
-        # TODO: add optional post-sampling clipping/rejection for domain-specific
-        # constraints (e.g. physicality cuts on masses or tidal parameters).
-        
         if len(samp.shape) == 1:
             samp = samp.reshape(1, self.num_vars)
 
@@ -123,9 +141,7 @@ class NFDist(BaseJointPriorDist):
         if self.scaler is not None:
             flow_samp = self.scaler.inverse_transform(flow_samp)
 
-        # TODO: add optional post-rescale clipping/rejection for domain-specific
-        # constraints (e.g. physicality cuts on masses or tidal parameters).
-        return flow_samp.astype(np.float64)
+        return self._clip_samples(flow_samp.astype(np.float64))
 
 
 class NFPrior(JointPrior):
