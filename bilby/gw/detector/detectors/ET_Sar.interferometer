@@ -1,0 +1,10 @@
+name = 'ET_Sar'
+power_spectral_density = PowerSpectralDensity(psd_file= 'ET_CoBA_15km.txt')
+length = 15
+minimum_frequency = 5
+maximum_frequency = 4096
+latitude = 40 + 31. / 60 + 0. / 3600
+longitude = 9 + 25. / 60 + 0. / 3600
+elevation = 0.0
+xarm_azimuth = 70.5674
+yarm_azimuth = 160.5674
