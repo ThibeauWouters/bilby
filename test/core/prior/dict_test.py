@@ -294,6 +294,30 @@ class TestPriorDict(unittest.TestCase):
         self.assertTrue(isinstance(out, np.ndarray))
         self.assertTrue(out.shape == (len(keys), size))
 
+    def test_sample_subset_constrained_size_one_array_validity(self):
+        """size=1 makes evaluate_constraints return a length-1 array.
+
+        Before the np.all(is_valid) fix this was cast with int(array), which
+        numpy >= 1.25 deprecates (an error in later numpy).
+        """
+        import warnings
+
+        priors = bilby.core.prior.PriorDict(
+            dict(
+                a=bilby.core.prior.Uniform(0, 1),
+                b=bilby.core.prior.Uniform(0, 1),
+                c=bilby.core.prior.Constraint(0, 0.5),
+            ),
+            conversion_function=lambda s: {**s, "c": s["a"] + s["b"]},
+        )
+        np.random.seed(3)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", DeprecationWarning)
+            for _ in range(20):
+                sample = priors.sample_subset_constrained(keys=["a", "b"], size=1)
+                self.assertEqual(np.shape(sample["a"]), (1,))
+                self.assertLessEqual(float(sample["a"][0] + sample["b"][0]), 0.5)
+
     def test_sample_subset_constrained(self):
 
         def conversion_function(parameters):
