@@ -465,9 +465,9 @@ class PriorDict(dict):
                 sample = self.sample_subset(keys=keys, size=size)
                 is_valid = self.evaluate_constraints(sample)
                 n_tested_samples += 1
-                n_valid_samples += int(is_valid)
+                n_valid_samples += int(np.all(is_valid))
                 check_efficiency(n_tested_samples, n_valid_samples)
-                if is_valid:
+                if np.all(is_valid):
                     return sample
         else:
             needed = np.prod(size)
