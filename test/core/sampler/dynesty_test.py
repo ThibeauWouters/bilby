@@ -179,6 +179,31 @@ class ProposalsTest(unittest.TestCase):
         del specific["diff"]["live"]
         self.assertDictEqual(specific, dict(diff=dict(mix=0.5, scale=1.19)))
 
+    def test_get_proposal_kwargs_diff_excludes_current_point(self):
+        """The current point is removed from the differential-evolution pool.
+
+        Before the fix, np.delete's result was discarded, so the pool still
+        held the current point (and a zero difference vector was possible).
+        """
+        live = np.array([
+            [0.1, 0.2, 0.3],
+            [0.5, 0.5, 0.5],
+            [0.7, 0.8, 0.9],
+            [0.5, 0.5, 0.5],
+            [0.2, 0.4, 0.6],
+        ])
+        current = live[1].copy()
+        args = Dummy(
+            u=current, axes=np.eye(3), scale=1,
+            kwargs=dict(walks=10, live=live, periodic=None, reflective=None),
+        )
+        dynesty_utils._SamplingContainer.proposals = ["diff"]
+        _, _, specific = dynesty_utils._get_proposal_kwargs(args)
+        pool = specific["diff"]["live"]
+        expected = np.array([[0.1, 0.2, 0.3], [0.2, 0.4, 0.6], [0.7, 0.8, 0.9]])
+        np.testing.assert_array_equal(pool, expected)
+        self.assertFalse(np.any(np.all(pool == current, axis=1)))
+
     def test_get_proposal_kwargs_volumetric(self):
         args = Dummy(u=-np.ones(4), axes=np.zeros((2, 2)), scale=4)
         dynesty_utils._SamplingContainer.proposals = ["volumetric"]
