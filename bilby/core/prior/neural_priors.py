@@ -15,11 +15,40 @@ from ..utils import logger
 import joblib
 from neural_priors_gym.flows.base import FlowBase
 
+try:
+    from neural_priors_gym.preprocessing import (
+        flow_to_physical,
+        load_preprocessing,
+        physical_log_prob,
+    )
+except ImportError:  # neural_priors_gym without the preprocessing record
+    load_preprocessing = None
+
 class NFDist(BaseJointPriorDist):
     """Multivariate joint prior distribution backed by a neural_priors_gym flow.
 
     Loads a flow trained with neural_priors_gym's FlowTrainer from a model
     directory containing model.pt, model_kwargs.json, and optionally scaler.gz.
+
+    Two model formats are supported:
+
+    - **With a preprocessing record** (the ``"preprocessing"`` entry of
+      ``model_kwargs.json``, written by neural_priors_gym for every backend):
+      the flow was trained on ``y = T(x)``, with ``T`` an optional ln(x) or
+      ln(1 - x) per parameter followed by an affine scaler (min-max or
+      standard). ``ln_prob`` is the flow density at ``T(x)`` plus
+      ``log|det dT/dx|``; ``rescale`` and ``sample`` map flow output back with
+      ``T^-1``. Points where a transform is undefined (``x <= 0`` for ln(x),
+      ``x >= 1`` for ln(1 - x)) get ``-inf`` and are never produced. No
+      clipping is applied, so ``rescale``/``sample`` and ``ln_prob`` describe
+      the same density (there is no point mass at the bounds). Samples
+      outside the declared ``bounds`` get ``-inf`` in ``ln_prob``; at
+      construction the flow mass outside the bounds is estimated and a
+      warning is logged when it is non-zero, because ``rescale`` does not
+      truncate.
+    - **Without a record** (older models, including those of
+      arXiv:2511.22987): the pickled MinMaxScaler in ``scaler.gz`` is used and
+      samples are clipped to the bounds, exactly as before.
 
     Parameters
     ----------
@@ -42,9 +71,27 @@ class NFDist(BaseJointPriorDist):
         self.flow_dir = str(flow_dir)
         self._flow: FlowBase = FlowBase.load_from_dir(flow_dir_path)
 
-        # Load the MinMaxScaler produced during training, if present
-        scaler_path = flow_dir_path / "scaler.gz"
-        if scaler_path.exists():
+        self.preprocessing = (
+            None if load_preprocessing is None else load_preprocessing(flow_dir_path)
+        )
+        if self.preprocessing is not None:
+            record_names = list(self.preprocessing["parameter_names"])
+            if record_names != list(names):
+                raise ValueError(
+                    f"NFDist names {list(names)} do not match the parameter names "
+                    f"the flow in {flow_dir} was trained on: {record_names}"
+                )
+            # The record replaces scaler.gz (which may also be present).
+            self.scaler = None
+            self.log_jacobian_correction = 0.0
+            logger.info(
+                f"Using the preprocessing record of {flow_dir}: scaler "
+                f"{(self.preprocessing.get('scaler') or {}).get('type')}, "
+                f"log {self.preprocessing.get('log_transform')}, "
+                f"log(1 - x) {self.preprocessing.get('log1m_transform')}"
+            )
+        # Old format: load the MinMaxScaler produced during training, if present
+        elif (scaler_path := flow_dir_path / "scaler.gz").exists():
             self.scaler = joblib.load(scaler_path)
             self.log_jacobian_correction = FlowBase.compute_log_jacobian_correction(
                 self.scaler
@@ -83,6 +130,27 @@ class NFDist(BaseJointPriorDist):
         logger.info(
             f"Loaded NFDist with n_dim={self.num_vars} from {flow_dir}"
         )
+        if self.preprocessing is not None:
+            self._warn_mass_outside_bounds()
+
+    def _outside_bounds(self, samples: np.ndarray) -> np.ndarray:
+        """Rows with any coordinate outside the declared bounds (or NaN)."""
+        out = np.zeros(samples.shape[0], dtype=bool)
+        for col, name in enumerate(self.names):
+            lo, hi = self._bounds_dict[name]
+            s = samples[:, col]
+            out |= ~((s >= lo) & (s <= hi))
+        return out
+
+    def _warn_mass_outside_bounds(self, n: int = 20_000) -> None:
+        """Estimate the flow mass outside the declared bounds (new format only)."""
+        frac = float(np.mean(self._outside_bounds(self._sample(n))))
+        if frac > 0:
+            logger.warning(
+                f"NFDist: about {100 * frac:.3g}% of the flow mass in {self.flow_dir} "
+                "lies outside the declared bounds. rescale/sample do not truncate, "
+                "while ln_prob is -inf there; widen the bounds to make them consistent."
+            )
 
     def _clip_samples(self, samples: np.ndarray) -> np.ndarray:
         """Clip samples to the declared bounds (column order matches self.names).
@@ -99,6 +167,8 @@ class NFDist(BaseJointPriorDist):
     def _sample(self, size, **_kwargs):
         """Draw samples from the flow in the original (unscaled) parameter space."""
         raw = self._flow.sample(int(size))
+        if self.preprocessing is not None:
+            return flow_to_physical(raw, self.preprocessing)
         if self.scaler is not None:
             raw = self.scaler.inverse_transform(raw)
         raw = self._clip_samples(raw.astype(np.float64))
@@ -112,6 +182,17 @@ class NFDist(BaseJointPriorDist):
         """
         if len(samp.shape) == 1:
             samp = samp.reshape(1, self.num_vars)
+
+        if self.preprocessing is not None:
+            # BaseJointPriorDist._check_samp only reports the out-of-bounds rows
+            # of one parameter, so recompute them over all parameters.
+            inside = ~(outbounds | self._outside_bounds(samp))
+            lnprob[:] = -np.inf
+            if np.any(inside):
+                lnprob[inside] = physical_log_prob(
+                    self._flow.log_prob, samp[inside], self.preprocessing
+                )
+            return lnprob
 
         if self.scaler is not None:
             scaled = self.scaler.transform(samp)
@@ -137,6 +218,11 @@ class NFDist(BaseJointPriorDist):
 
         # Map from the latent space (standard normal) to the data space using the flow's generative direction
         flow_samp = self._flow.latent_to_data(mvg_samp)
+
+        if self.preprocessing is not None:
+            # No clipping: flow_to_physical maps every finite point into the
+            # support of the transforms (e.g. q < 1 for ln(1 - q)).
+            return flow_to_physical(flow_samp, self.preprocessing)
 
         # In case we scaled training data, then rescale back to the very original parameter space
         if self.scaler is not None:
