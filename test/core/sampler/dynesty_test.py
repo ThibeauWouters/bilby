@@ -386,3 +386,37 @@ class TestReproducibility(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDynestyQueueSize(unittest.TestCase):
+    """queue_size is one of the npool-equivalent kwargs, so passing it next to npool used to make it the pool size as well
+    (npool=128, queue_size=512 gave a 512-process pool). An explicit npool must set the pool, queue_size only dynesty's queue."""
+
+    def make(self, **kwargs):
+        priors = bilby.core.prior.PriorDict(dict(a=bilby.core.prior.Uniform(0, 1), b=bilby.core.prior.Uniform(0, 1)))
+        return bilby.core.sampler.dynesty.Dynesty(
+            DummyLikelihood(), priors, outdir="outdir", label="label", use_ratio=False, plot=False,
+            skip_import_verification=True, **kwargs)
+
+    def test_npool_alone_sets_queue_size(self):
+        sampler = self.make(npool=4)
+        self.assertEqual(sampler.npool, 4)
+        self.assertEqual(sampler.kwargs["queue_size"], 4)
+
+    def test_explicit_npool_and_larger_queue_size(self):
+        sampler = self.make(npool=4, queue_size=16)
+        self.assertEqual(sampler.npool, 4)
+        self.assertEqual(sampler.kwargs["queue_size"], 16)
+
+    def test_queue_size_alone_still_sets_pool(self):
+        sampler = self.make(queue_size=3)
+        self.assertEqual(sampler.npool, 3)
+        self.assertEqual(sampler.kwargs["queue_size"], 3)
+
+    def test_pool_has_npool_processes(self):
+        sampler = self.make(npool=2, queue_size=8)
+        sampler._setup_pool()
+        try:
+            self.assertEqual(sampler.pool._processes, 2)
+        finally:
+            sampler._close_pool()

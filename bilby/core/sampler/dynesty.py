@@ -156,6 +156,11 @@ class Dynesty(NestedSampler):
     sampling_seed_key = "seed"
 
     @property
+    def npool(self):
+        explicit = getattr(self, "_explicit_npool", None)
+        return explicit if explicit is not None else super().npool
+
+    @property
     def _dynesty_init_kwargs(self):
         params = inspect.signature(self.sampler_init).parameters
         kwargs = {
@@ -280,6 +285,10 @@ class Dynesty(NestedSampler):
             for equiv in self.npool_equiv_kwargs:
                 if equiv in kwargs:
                     kwargs["queue_size"] = kwargs.pop(equiv)
+        elif "npool" in kwargs:
+            # npool and queue_size both given: npool is the pool size, queue_size only the dynesty queue (a queue larger than
+            # the pool balances variable-length walks over the workers). Without this, queue_size became the pool size too.
+            self._explicit_npool = kwargs.pop("npool")
         if "seed" in kwargs:
             seed = kwargs.get("seed")
             if "rstate" not in kwargs:
